@@ -13,10 +13,13 @@ android {
         applicationId = "com.smoothcam"
         minSdk = 33
         targetSdk = 35
-        // Version: set versionName by hand when releasing a new version.
-        // versionCode comes from the cloud build number, so every APK installs over the previous one.
-        versionCode = System.getenv("GITHUB_RUN_NUMBER")?.toIntOrNull() ?: 1
-        versionName = "0.5"
+        // Version = "<baseVersion>.<build number>", e.g. 0.5.7. Raise baseVersion by hand for a new
+        // version; the build number comes from the cloud build, so every build is a newer version.
+        // The release tag uses the same string (v0.5.7), which is what update checkers like Obtainium compare.
+        val baseVersion = "0.5"
+        val buildNumber = System.getenv("GITHUB_RUN_NUMBER")?.toIntOrNull() ?: 0
+        versionCode = maxOf(buildNumber, 1)
+        versionName = "$baseVersion.$buildNumber"
     }
 
     buildTypes {
