@@ -75,6 +75,7 @@ import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.abs
 import kotlin.math.exp
 import kotlin.math.ln
+import kotlin.math.pow
 import kotlin.math.roundToInt
 
 /**
@@ -122,6 +123,18 @@ class MainActivity : Activity() {
     @Volatile private var sessionStab = CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_OFF
     private val failureLog = ArrayDeque<String>() // recent session failures, for the camera-info dialog
     private var wantedLabel = ""                  // what the user asked for, for fallback messages
+
+    // RAW+ (burst of RAW frames, merged and developed by RawProcessor)
+    private var rawSize: Size? = null
+    @Volatile private var rawOn = false
+    private var rawReader: ImageReader? = null
+    private var rawShot: RawShot? = null
+    private lateinit var rawButton: Button
+
+    private class RawShot(val n: Int, val boost: Float, val zoom: Float, val orientation: Int) {
+        val images = HashMap<Long, Image>()
+        val results = HashMap<Long, TotalCaptureResult>()
+    }
 
     // Ultrawide fill: the ultrawide lens shown, dimmed, around the photo frame (if the camera allows it)
     private var uwPhysicalId: String? = null
@@ -396,6 +409,13 @@ class MainActivity : Activity() {
         maxResSize = if (pixelModeAllowed && maxYuv != null &&
             maxYuv.width * maxYuv.height >= 2 * photoSize.width * photoSize.height) maxYuv else null
         Log.i(TAG, "max-res mode: allowed=$pixelModeAllowed size=$maxYuv -> ${maxResSize ?: "not available"}")
+
+        // RAW+ needs RAW output from the camera.
+        rawSize = if (caps.contains(CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_RAW)) {
+            map.getOutputSizes(ImageFormat.RAW_SENSOR)?.maxByOrNull { it.width * it.height }
+        } else {
+            null
+        }
         return true
     }
 
@@ -1152,6 +1172,14 @@ class MainActivity : Activity() {
             Gravity.TOP or Gravity.START
         ).apply { topMargin = dp(92); leftMargin = dp(16) })
 
+        rawButton = pillButton().apply {
+            text = "RAW+"
+            setOnClickListener { cameraHandler.post { toggleRaw() } }
+        }
+        root.addView(rawButton, FrameLayout.LayoutParams(dp(72), dp(34),
+            Gravity.TOP or Gravity.START
+        ).apply { topMargin = dp(92); leftMargin = if (maxResSize != null) dp(96) else dp(16) })
+
         // PHOTO | VIDEO switch above the shutter, like the iPhone camera.
         val tabs = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -1208,7 +1236,7 @@ class MainActivity : Activity() {
         setContentView(root)
         // Only compact (square or round) controls turn with the phone; the PHOTO/VIDEO labels and the
         // slider stay put, as on iPhone.
-        rotatables += listOf(recText, hdrButton, maxResButton, resLabel, fpsLabel, evChip, shutterChip, isoChip, thumbView)
+        rotatables += listOf(recText, hdrButton, maxResButton, rawButton, resLabel, fpsLabel, evChip, shutterChip, isoChip, thumbView)
         rotatables += lensButtons
         styleRecordButton(false)
         updateButtons()
@@ -1286,6 +1314,8 @@ class MainActivity : Activity() {
         fpsLabel.alpha = idleAlpha
         hdrButton.visibility = if (photoMode || !hdrSupported) View.GONE else View.VISIBLE
         maxResButton.visibility = if (photoMode && maxResSize != null) View.VISIBLE else View.GONE
+        rawButton.visibility = if (photoMode && rawSize != null) View.VISIBLE else View.GONE
+        stylePill(rawButton, rawOn)
         maxResSize?.let { maxResButton.text = String.format(Locale.US, "%.0f MP", it.width * it.height / 1_000_000.0) }
         stylePill(maxResButton, fiftyMpOn)
         photoTab.setTextColor(if (photoMode) Color.rgb(255, 196, 0) else Color.WHITE)
@@ -1360,7 +1390,10 @@ class MainActivity : Activity() {
     }
 
     private fun applyZoomRatio(z: Float) {
-        zoomRatio = z.coerceIn(zoomRange.lower, zoomRange.upper)
+        val raw = photoMode && rawOn
+        val lo = if (raw) maxOf(1f, zoomRange.lower) else zoomRange.lower
+        val hi = if (raw) rawMaxZoom() else zoomRange.upper
+        zoomRatio = z.coerceIn(lo, maxOf(lo, hi))
         zoomDial.zoom = zoomRatio
         updateLensButtons()
         positionBackground()
@@ -1596,6 +1629,7 @@ class MainActivity : Activity() {
         sb.append("Shutter priority: ${exposure.shutterPriority}, ISO priority: ${exposure.isoPriority}\n")
         sb.append("ISO ${exposure.isoRange}, shutter ${ExposureControl.formatShutter(exposure.expRange.lower)}–${ExposureControl.formatShutter(exposure.expRange.upper)}\n")
         sb.append("Full-resolution photo mode: ${maxResSize ?: "not offered to apps"}\n")
+        sb.append("RAW: ${rawSize ?: "not offered to apps"}\n")
         sb.append("Ultrawide fill: " + when {
             uwPhysicalId == null -> "no ultrawide lens offered to apps"
             !bgAllowed -> "camera refused the extra stream"
@@ -1625,9 +1659,9 @@ class MainActivity : Activity() {
 
     private fun updateStatus() {
         if (photoMode) {
-            val size = if (fiftyMpOn) maxResSize ?: photoSize else photoSize
+            val size = if (fiftyMpOn) maxResSize ?: photoSize else if (rawOn) rawSize ?: photoSize else photoSize
             val mp = size.width * size.height / 1_000_000.0
-            val parts = mutableListOf(String.format(Locale.US, "Photo %.0f MP", mp))
+            val parts = mutableListOf(String.format(Locale.US, if (rawOn) "RAW+ %.0f MP" else "Photo %.0f MP", mp))
             if (measuredFps > 0) parts += String.format(Locale.US, "%.1f fps", measuredFps)
             if (lastIso > 0) parts += "ISO $lastIso"
             statusText.text = parts.joinToString("  ·  ")
@@ -1671,6 +1705,7 @@ class MainActivity : Activity() {
     private fun toggleMaxRes() {
         if (!photoMode || maxResSize == null || processingPhoto) return
         fiftyMpOn = !fiftyMpOn
+        if (fiftyMpOn) rawOn = false
         mainHandler.post {
             updateButtons()
             updateStatus()
@@ -1759,10 +1794,21 @@ class MainActivity : Activity() {
 
         val maxSize = maxResSize
         val useMax = fiftyMpOn && maxSize != null
+        val rSize = rawSize
+        val useRaw = rawOn && rSize != null && !useMax
         val outputs: List<OutputConfiguration>
         val reader: ImageReader?
         val maxReader: ImageReader?
-        if (useMax && maxSize != null) {
+        var newRaw: ImageReader? = null
+        if (useRaw && rSize != null) {
+            // RAW+: viewfinder plus a RAW stream that only receives the burst when you press the shutter.
+            reader = null
+            maxReader = null
+            val rr = ImageReader.newInstance(rSize.width, rSize.height, ImageFormat.RAW_SENSOR, RAW_BURST_MAX + 2)
+            rr.setOnImageAvailableListener({ r -> onRawImage(r) }, cameraHandler)
+            newRaw = rr
+            outputs = listOf(OutputConfiguration(surfaceView.holder.surface), OutputConfiguration(rr.surface))
+        } else if (useMax && maxSize != null) {
             // 50 MP: preview runs in the normal (binned) sensor mode; a separate full-res stream is
             // used only for the shot itself, so there's no zero-lag buffer in this mode.
             reader = null
@@ -1792,12 +1838,16 @@ class MainActivity : Activity() {
             bgAllowed = false
             reader?.close()
             maxReader?.close()
+            newRaw?.close()
             photoReader = null
             maxResReader = null
+            rawReader = null
             startPhotoSession()
         }
         photoReader = reader
         maxResReader = maxReader
+        val rawR = newRaw
+        rawReader = rawR
 
         val params = photoRequestBuilder(cam)
         val config = SessionConfiguration(
@@ -1806,7 +1856,7 @@ class MainActivity : Activity() {
             cameraExecutor,
             object : CameraCaptureSession.StateCallback() {
                 override fun onConfigured(s: CameraCaptureSession) {
-                    if (device == null || photoReader !== reader || maxResReader !== maxReader || !photoMode) {
+                    if (device == null || photoReader !== reader || maxResReader !== maxReader || rawReader !== rawR || !photoMode) {
                         s.close()
                         return
                     }
@@ -1825,6 +1875,11 @@ class MainActivity : Activity() {
                 override fun onConfigureFailed(s: CameraCaptureSession) {
                     if (useBg) {
                         dropBgAndRetry("the camera rejected the extra ultrawide stream")
+                    } else if (useRaw) {
+                        logFailure("Camera rejected the RAW+ session")
+                        rawOn = false
+                        toast("RAW+ isn't available on this camera")
+                        startPhotoSession()
                     } else if (useMax) {
                         fiftyMpOn = false
                         toast("50 MP mode isn't available to apps on this camera")
@@ -1873,12 +1928,21 @@ class MainActivity : Activity() {
             shotsInFlight.decrementAndGet()
             mainHandler.post { showProcessing(false) }
         }
-        for (r in listOfNotNull(photoReader, maxResReader)) {
+        rawShot?.let { shot ->
+            // A RAW burst was in flight; it can't complete now.
+            shot.images.values.forEach { it.close() }
+            rawShot = null
+            processingPhoto = false
+            shotsInFlight.decrementAndGet()
+            mainHandler.post { showProcessing(false) }
+        }
+        for (r in listOfNotNull(photoReader, maxResReader, rawReader)) {
             r.setOnImageAvailableListener(null, null)
             if (processingPhoto) pendingReaderClose += r else r.close()
         }
         photoReader = null
         maxResReader = null
+        rawReader = null
     }
 
     private fun closePendingReaders() {
@@ -1894,6 +1958,10 @@ class MainActivity : Activity() {
         if (!photoMode || session == null) return
         if (processingPhoto) {
             toast("One moment…")
+            return
+        }
+        if (rawReader != null) {
+            takeRawPhoto()
             return
         }
         if (maxResReader != null) {
@@ -1925,6 +1993,169 @@ class MainActivity : Activity() {
         }
         processFrames(frames, iso, orientation)
     }
+
+    /**
+     * Camera thread. RAW+: shoot a short burst of RAW frames, slightly underexposed so highlights
+     * survive (the merge removes the extra noise and the developer restores the brightness).
+     */
+    private fun takeRawPhoto() {
+        val cam = device ?: return
+        val s = session ?: return
+        val rr = rawReader ?: return
+        if (rawShot != null || shotsInFlight.get() > 0) {
+            toast("Still saving the last photo")
+            return
+        }
+        val manual = !exposure.isFullyAuto
+        val baseExp = if (lastExposureNs > 0) lastExposureNs else 16_666_666L
+        val baseIso = if (lastIso > 0) lastIso else 400
+        val dark = baseIso >= 1600
+        val n = if (dark) RAW_BURST_MAX else 6
+        val under = if (manual) 0f else if (dark) 0.5f else 1f
+        val factor = 2.0.pow(-under.toDouble())
+        var e = (baseExp * factor).toLong()
+        var iso = baseIso
+        if (e < exposure.expRange.lower) {
+            iso = (baseIso * baseExp * factor / exposure.expRange.lower).roundToInt()
+                .coerceIn(exposure.isoRange.lower, exposure.isoRange.upper)
+            e = exposure.expRange.lower
+        }
+        val requests = try {
+            (0 until n).map {
+                val b = cam.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
+                b.addTarget(rr.surface)
+                b.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
+                b.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+                b.set(CaptureRequest.STATISTICS_LENS_SHADING_MAP_MODE, CameraMetadata.STATISTICS_LENS_SHADING_MAP_MODE_ON)
+                applyZoom(b)
+                if (manual) {
+                    exposure.apply(b, photoFpsRange.upper, 33_333_333L, video = false)
+                } else {
+                    b.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_OFF)
+                    b.set(CaptureRequest.SENSOR_EXPOSURE_TIME, e)
+                    b.set(CaptureRequest.SENSOR_SENSITIVITY, iso)
+                    b.set(CaptureRequest.SENSOR_FRAME_DURATION, maxOf(e, 33_333_333L))
+                }
+                b.build()
+            }
+        } catch (ex: Exception) {
+            toast("RAW capture failed: ${ex.message}")
+            return
+        }
+        val shot = RawShot(n, 2.0.pow(under.toDouble()).toFloat(), zoomRatio, (sensorOrientation + deviceOrientation) % 360)
+        rawShot = shot
+        processingPhoto = true
+        shotsInFlight.incrementAndGet()
+        mainHandler.post {
+            flashPreview()
+            showProcessing(true)
+        }
+        try {
+            s.captureBurst(requests, object : CameraCaptureSession.CaptureCallback() {
+                override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
+                    val ts = result.get(CaptureResult.SENSOR_TIMESTAMP) ?: return
+                    if (rawShot !== shot) return
+                    shot.results[ts] = result
+                    completeRawShotIfReady()
+                }
+
+                override fun onCaptureFailed(session: CameraCaptureSession, request: CaptureRequest, failure: CaptureFailure) {
+                    failRawShot(shot, "RAW capture failed (reason ${failure.reason})")
+                }
+            }, cameraHandler)
+        } catch (ex: Exception) {
+            failRawShot(shot, "RAW capture failed: ${ex.message}")
+            return
+        }
+        cameraHandler.postDelayed({ if (rawShot === shot) failRawShot(shot, "RAW capture timed out") }, 6_000)
+    }
+
+    /** Camera thread. */
+    private fun onRawImage(r: ImageReader) {
+        val img = try { r.acquireNextImage() } catch (e: IllegalStateException) { null } ?: return
+        val shot = rawShot
+        if (shot == null || shot.images.size >= shot.n) {
+            img.close()
+            return
+        }
+        shot.images[img.timestamp] = img
+        completeRawShotIfReady()
+    }
+
+    /** Camera thread. Images and their metadata arrive separately; go on once every frame has both. */
+    private fun completeRawShotIfReady() {
+        val shot = rawShot ?: return
+        if (shot.images.size < shot.n || shot.results.size < shot.n) return
+        val keys = shot.images.keys.filter { shot.results.containsKey(it) }.sorted()
+        if (keys.size < shot.n) return
+        rawShot = null
+        val images = keys.map { shot.images.getValue(it) }
+        val meta = RawProcessor.Meta.from(chars, shot.results.getValue(keys[0]), shot.boost, shot.zoom)
+        copyExecutor.execute {
+            val frames = try {
+                images.map<Image, RawProcessor.RawFrame?> { RawProcessor.RawFrame.copyOf(it) }.toMutableList()
+            } catch (e: Throwable) {
+                Log.e(TAG, "copying RAW frames failed", e)
+                null
+            } finally {
+                images.forEach { try { it.close() } catch (e: Exception) { /* ignore */ } }
+            }
+            cameraHandler.post {
+                processingPhoto = false
+                closePendingReaders()
+            }
+            if (frames == null) {
+                shotsInFlight.decrementAndGet()
+                mainHandler.post { showProcessing(false) }
+                toast("Couldn't capture the RAW burst")
+                return@execute
+            }
+            photoExecutor.execute {
+                val t0 = SystemClock.elapsedRealtime()
+                val uri = try {
+                    RawProcessor.processAndSave(this, frames, meta, shot.orientation)
+                } catch (e: Throwable) {
+                    Log.e(TAG, "RAW processing failed", e)
+                    null
+                }
+                val secs = (SystemClock.elapsedRealtime() - t0) / 1000.0
+                shotsInFlight.decrementAndGet()
+                if (uri != null) showMediaThumbnail(uri, "image/jpeg")
+                mainHandler.post { showProcessing(false) }
+                toast(if (uri != null) String.format(Locale.US, "RAW+ photo saved (%.1f s)", secs) else "Couldn't develop the RAW photo")
+            }
+        }
+    }
+
+    /** Camera thread. */
+    private fun failRawShot(shot: RawShot, msg: String) {
+        if (rawShot !== shot) return
+        rawShot = null
+        shot.images.values.forEach { it.close() }
+        processingPhoto = false
+        shotsInFlight.decrementAndGet()
+        closePendingReaders()
+        mainHandler.post { showProcessing(false) }
+        logFailure(msg)
+        toast(msg)
+    }
+
+    /** Camera thread. Switch RAW+ on or off (photo mode). */
+    private fun toggleRaw() {
+        if (!photoMode || rawSize == null || processingPhoto || shotsInFlight.get() > 0) return
+        rawOn = !rawOn
+        if (rawOn) fiftyMpOn = false
+        mainHandler.post {
+            applyZoomRatio(zoomRatio) // RAW+ works with the main lens: keep zoom within it
+            updateButtons()
+            updateStatus()
+            if (rawOn) toast("RAW+: merged RAW burst, main lens (1×–${zoomLabel(rawMaxZoom())})")
+        }
+        startSession()
+    }
+
+    /** RAW frames come uncropped from whichever lens is active, so RAW+ stays on the main lens. */
+    private fun rawMaxZoom(): Float = zoomPresets.firstOrNull { it >= 4.99f }?.let { it - 0.1f } ?: zoomRange.upper
 
     /** Camera thread. One full-resolution still; the preview pauses briefly while the sensor switches mode. */
     private fun takeMaxResPhoto() {
@@ -2147,6 +2378,7 @@ class MainActivity : Activity() {
         private const val ZSL_MAX_IMAGES = 9  // camera buffers for the full-res stream
         private const val ZSL_RING = 4        // frames kept for the next shot
         private const val PHOTO_BURST = 4     // frames merged per photo
+        private const val RAW_BURST_MAX = 8   // RAW frames in dark scenes (6 otherwise)
         private const val MAX_QUEUED_SHOTS = 3 // photos waiting to be saved (each holds ~75 MB)
     }
 }

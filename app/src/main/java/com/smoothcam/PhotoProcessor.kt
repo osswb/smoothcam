@@ -89,6 +89,16 @@ object PhotoProcessor {
         return save(context, nv21, w, h, orientationDeg)
     }
 
+    /**
+     * Applies the look to an already developed 8-bit YUV image (from the RAW+ pipeline) and saves it.
+     * RAW+ has restored brightness itself, so the midtone lift is skipped there.
+     */
+    fun finishAndSave(context: Context, y: ByteArray, u: ByteArray, v: ByteArray, w: Int, h: Int,
+                      orientationDeg: Int, rawLook: Boolean): Uri {
+        val nv21 = toneMapToNv21(y, u, v, w, h, if (rawLook) 1.0 else MIDTONE_GAMMA)
+        return save(context, nv21, w, h, orientationDeg)
+    }
+
     /** A small, quickly made preview of a frame for the gallery button (nearest-neighbour, no look applied). */
     fun quickThumbnail(f: YuvFrame, orientationDeg: Int, size: Int = 160): Bitmap {
         val scale = max(1, min(f.width, f.height) / size)
@@ -301,13 +311,13 @@ object PhotoProcessor {
     }
 
     /** Index i represents input value i / 2 (0..511.5), so boosted values above 255 roll off smoothly. */
-    private fun buildToneLut(): IntArray {
+    private fun buildToneLut(midGamma: Double): IntArray {
         val k = SHOULDER_KNEE
         fun shoulder(y: Double) = if (y <= k) y else k + (1 - k) * (1 - exp(-(y - k) / (1 - k)))
         val white = shoulder(1.0) // rescale so that input white (255) stays pure white
         return IntArray(1024) { i ->
             val u = (i / 2.0) / 255.0
-            var y = shoulder(u.pow(MIDTONE_GAMMA)) / white
+            var y = shoulder(u.pow(midGamma)) / white
             y = max(0.0, (y - BLACK_POINT) / (1 - BLACK_POINT))
             (y * 255.0 + 0.5).toInt().coerceIn(0, 255)
         }
@@ -337,14 +347,14 @@ object PhotoProcessor {
     }
 
     /** Everything the per-pixel look needs, built once per photo. */
-    private class Look(yP: ByteArray, val w: Int, val h: Int) {
+    private class Look(yP: ByteArray, val w: Int, val h: Int, midGamma: Double) {
         val f = 16
         val bw = max(1, w / f)
         val bh = max(1, h / f)
         // Brightness map at 1/16 scale, blurred, used to decide local shadow lift.
         val base = PhotoProcessor.boxBlur(PhotoProcessor.boxBlur(PhotoProcessor.downscale(yP, w, h, f), bw, bh, 2), bw, bh, 2)
         val gainLut = PhotoProcessor.buildGainLut()
-        val toneLut = PhotoProcessor.buildToneLut()
+        val toneLut = PhotoProcessor.buildToneLut(midGamma)
     }
 
     /**
@@ -409,10 +419,10 @@ object PhotoProcessor {
      * Applies the look and writes the result straight into an NV21 buffer, one 2x2 block at a time.
      * Skipping a full-size RGB bitmap halves memory use, which is what lets 50 MP photos fit.
      */
-    private fun toneMapToNv21(yP: ByteArray, uP: ByteArray, vP: ByteArray, w: Int, h: Int): ByteArray {
+    private fun toneMapToNv21(yP: ByteArray, uP: ByteArray, vP: ByteArray, w: Int, h: Int, midGamma: Double = MIDTONE_GAMMA): ByteArray {
         val cw = w / 2
         val ch = h / 2
-        val look = Look(yP, w, h)
+        val look = Look(yP, w, h, midGamma)
         val out = ByteArray(w * h + 2 * cw * ch)
         val uvBase = w * h
         parallelRows(ch) { by0, by1 ->
@@ -495,7 +505,7 @@ object PhotoProcessor {
 
     // ---------------------------------------------------------------- threading
 
-    private fun parallelRows(h: Int, block: (Int, Int) -> Unit) {
+    internal fun parallelRows(h: Int, block: (Int, Int) -> Unit) {
         val n = threadCount
         val chunk = (h + n - 1) / n
         val error = AtomicReference<Throwable?>(null)
