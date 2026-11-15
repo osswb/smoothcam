@@ -73,6 +73,8 @@ import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.abs
+import kotlin.math.exp
+import kotlin.math.ln
 import kotlin.math.roundToInt
 
 /**
@@ -120,6 +122,17 @@ class MainActivity : Activity() {
     @Volatile private var sessionStab = CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_OFF
     private val failureLog = ArrayDeque<String>() // recent session failures, for the camera-info dialog
     private var wantedLabel = ""                  // what the user asked for, for fallback messages
+
+    // Ultrawide fill: the ultrawide lens shown, dimmed, around the photo frame (if the camera allows it)
+    private var uwPhysicalId: String? = null
+    private var uwFovRatio = 1f        // how much wider the ultrawide sees than the main lens
+    private var uwSize: Size? = null
+    private lateinit var bgSurfaceView: SurfaceView
+    private lateinit var scrim: ScrimView
+    @Volatile private var bgSurfaceReady = false
+    @Volatile private var bgActive = false   // the running session streams the ultrawide
+    @Volatile private var bgAllowed = true   // cleared if the camera refuses the extra stream
+    private var zoomAnimator: android.animation.ValueAnimator? = null
 
     // Zoom / lenses
     private var zoomRange: Range<Float> = Range(1f, 1f)
@@ -317,6 +330,7 @@ class MainActivity : Activity() {
         if (zoomRange.lower < 0.95f) zoomPresets += zoomRange.lower
         zoomPresets += 1f
         for (z in listOf(2f, 5f, 10f)) if (zoomRange.upper >= z) zoomPresets += z
+        findUltrawide()
         sensorOrientation = chars.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
 
         val map = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP) ?: return false
@@ -383,6 +397,47 @@ class MainActivity : Activity() {
             maxYuv.width * maxYuv.height >= 2 * photoSize.width * photoSize.height) maxYuv else null
         Log.i(TAG, "max-res mode: allowed=$pixelModeAllowed size=$maxYuv -> ${maxResSize ?: "not available"}")
         return true
+    }
+
+    /**
+     * Look for an ultrawide lens that apps may stream alongside the main view (a "physical camera"
+     * behind the logical one). Only then can the area around the photo frame show the wider view.
+     */
+    private fun findUltrawide() {
+        try {
+            val physical = chars.physicalCameraIds
+            if (physical.isEmpty()) return
+            fun fov(c: CameraCharacteristics): Float? {
+                val f = c.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.minOrNull() ?: return null
+                val size = c.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE) ?: return null
+                return size.width / f
+            }
+            var bestId: String? = null
+            var bestFov = 0f
+            var bestChars: CameraCharacteristics? = null
+            for (pid in physical) {
+                val pc = cameraManager.getCameraCharacteristics(pid)
+                val f = fov(pc) ?: continue
+                if (f > bestFov) { bestFov = f; bestId = pid; bestChars = pc }
+            }
+            val pc = bestChars ?: return
+            // Zoom ratio 1.0 is the main lens by definition, so the zoom range's lower end tells us
+            // how much wider the ultrawide is; fall back to focal lengths if needed.
+            val ratio = if (zoomRange.lower < 0.95f) 1f / zoomRange.lower else {
+                val mainFov = physical.mapNotNull { fov(cameraManager.getCameraCharacteristics(it)) }
+                    .filter { it < bestFov }.maxOrNull() ?: return
+                bestFov / mainFov
+            }
+            if (ratio < 1.3f) return
+            val sizes = pc.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)?.getOutputSizes(SurfaceHolder::class.java)
+            val size = sizes?.filter { it.width * 3 == it.height * 4 && it.width <= 1440 }?.maxByOrNull { it.width } ?: return
+            uwPhysicalId = bestId
+            uwFovRatio = ratio
+            uwSize = size
+            Log.i(TAG, "ultrawide fill candidate: $bestId ratio=$ratio size=$size")
+        } catch (e: Exception) {
+            Log.w(TAG, "no ultrawide fill", e)
+        }
     }
 
     // ---------------------------------------------------------------- display refresh
@@ -510,6 +565,10 @@ class MainActivity : Activity() {
             return
         }
         closePhotoReader()
+        if (bgActive) {
+            bgActive = false
+            mainHandler.post { positionBackground() }
+        }
         val cam = device ?: return
         if (variants.isEmpty()) {
             variants = buildVariants(hdrOn)
@@ -696,6 +755,7 @@ class MainActivity : Activity() {
                 val b = photoRequestBuilder(cam)
                 b.addTarget(surfaceView.holder.surface)
                 photoReader?.let { b.addTarget(it.surface) }
+                if (bgActive && bgSurfaceReady) b.addTarget(bgSurfaceView.holder.surface)
                 s.setRepeatingRequest(b.build(), captureCallback, cameraHandler)
                 return
             }
@@ -880,8 +940,24 @@ class MainActivity : Activity() {
         // Portrait UI: the 16:9 sensor image is shown rotated, so the view is 9:16.
         val w = resources.displayMetrics.widthPixels
         val h = w * previewSize.width / previewSize.height
+        // Ultrawide view behind the main viewfinder (sized and placed by positionBackground()).
+        bgSurfaceView = SurfaceView(this)
+        root.addView(bgSurfaceView, FrameLayout.LayoutParams(1, 1, Gravity.TOP or Gravity.START))
+        uwSize?.let { bgSurfaceView.holder.setFixedSize(it.width, it.height) }
+        bgSurfaceView.holder.addCallback(object : SurfaceHolder.Callback {
+            override fun surfaceCreated(holder: SurfaceHolder) { bgSurfaceReady = true }
+            override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {}
+            override fun surfaceDestroyed(holder: SurfaceHolder) { bgSurfaceReady = false }
+        })
+
         surfaceView = SurfaceView(this)
+        surfaceView.setZOrderMediaOverlay(true) // main viewfinder above the ultrawide one
         root.addView(surfaceView, FrameLayout.LayoutParams(w, h, Gravity.CENTER))
+        surfaceView.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> positionBackground() }
+
+        // Dims everything outside the frame that will be captured.
+        scrim = ScrimView(this)
+        root.addView(scrim, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
         surfaceView.holder.setFixedSize(previewSize.width, previewSize.height)
         // Pinch to zoom; the camera switches lenses by itself as the zoom ratio crosses them.
         val scaleDetector = ScaleGestureDetector(this, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
@@ -994,7 +1070,7 @@ class MainActivity : Activity() {
                 gravity = Gravity.CENTER
                 textSize = 12f
                 setTextColor(Color.WHITE)
-                setOnClickListener { setZoom(z) }
+                setOnClickListener { animateZoomTo(z) }
                 setOnLongClickListener {
                     zoomDial.show()
                     true
@@ -1277,12 +1353,67 @@ class MainActivity : Activity() {
 
     // ---------------------------------------------------------------- zoom
 
-    /** Main thread. */
+    /** Main thread. Jump to a zoom (pinch, dial). Cancels a running lens animation. */
     private fun setZoom(z: Float) {
+        zoomAnimator?.cancel()
+        applyZoomRatio(z)
+    }
+
+    private fun applyZoomRatio(z: Float) {
         zoomRatio = z.coerceIn(zoomRange.lower, zoomRange.upper)
         zoomDial.zoom = zoomRatio
         updateLensButtons()
+        positionBackground()
         requestRepeatingUpdate()
+    }
+
+    /** Main thread. Glide to a lens preset along a smooth zoom curve, like iPhone's lens buttons. */
+    private fun animateZoomTo(target: Float) {
+        zoomAnimator?.cancel()
+        val start = zoomRatio
+        val end = target.coerceIn(zoomRange.lower, zoomRange.upper)
+        if (abs(end - start) < 0.01f) return
+        val ls = ln(start.toDouble())
+        val le = ln(end.toDouble())
+        zoomAnimator = android.animation.ValueAnimator.ofFloat(0f, 1f).apply {
+            duration = 320
+            interpolator = android.view.animation.DecelerateInterpolator(1.6f)
+            addUpdateListener { va ->
+                val t = va.animatedValue as Float
+                applyZoomRatio(exp(ls + (le - ls) * t).toFloat())
+            }
+            start()
+        }
+    }
+
+    /**
+     * Main thread. Size the ultrawide view so its picture lines up with the main viewfinder: it is
+     * (ultrawide field of view / main field of view) x zoom times larger, centered on the frame.
+     */
+    private fun positionBackground() {
+        if (!::bgSurfaceView.isInitialized) return
+        val lp = bgSurfaceView.layoutParams as FrameLayout.LayoutParams
+        val scale = uwFovRatio * zoomRatio
+        val show = photoMode && bgActive && scale in 1.02f..4f
+        val fw = surfaceView.width.toFloat()
+        val fh = surfaceView.height.toFloat()
+        if (!show || fw <= 0f) {
+            if (lp.width != 1) {
+                lp.width = 1; lp.height = 1; lp.leftMargin = 0; lp.topMargin = 0
+                bgSurfaceView.layoutParams = lp
+            }
+        } else {
+            val cx = surfaceView.left + fw / 2f
+            val cy = surfaceView.top + fh / 2f
+            val bw = fw * scale
+            val bh = bw * 4f / 3f // portrait view of a 4:3 stream
+            lp.width = bw.toInt()
+            lp.height = bh.toInt()
+            lp.leftMargin = (cx - bw / 2f).toInt()
+            lp.topMargin = (cy - bh / 2f).toInt()
+            bgSurfaceView.layoutParams = lp
+        }
+        scrim.setHole(surfaceView.left, surfaceView.top, surfaceView.right, surfaceView.bottom)
     }
 
     private fun zoomLabel(z: Float): String = when {
@@ -1465,6 +1596,12 @@ class MainActivity : Activity() {
         sb.append("Shutter priority: ${exposure.shutterPriority}, ISO priority: ${exposure.isoPriority}\n")
         sb.append("ISO ${exposure.isoRange}, shutter ${ExposureControl.formatShutter(exposure.expRange.lower)}–${ExposureControl.formatShutter(exposure.expRange.upper)}\n")
         sb.append("Full-resolution photo mode: ${maxResSize ?: "not offered to apps"}\n")
+        sb.append("Ultrawide fill: " + when {
+            uwPhysicalId == null -> "no ultrawide lens offered to apps"
+            !bgAllowed -> "camera refused the extra stream"
+            bgActive -> "on (lens ${uwPhysicalId}, ${String.format(Locale.US, "%.2f", uwFovRatio)}× wider)"
+            else -> "available in photo mode"
+        } + "\n")
         if (!photoMode) {
             sb.append("\nAsked for: $wantedLabel\nRunning: ${modeName(modes[modeIndex], sessionHdr)}, ${stabName(sessionStab)}\n")
         }
@@ -1642,13 +1779,30 @@ class MainActivity : Activity() {
             reader.setOnImageAvailableListener({ r -> onZslImage(r) }, cameraHandler)
             outputs = listOf(OutputConfiguration(surfaceView.holder.surface), OutputConfiguration(reader.surface))
         }
+        // Optional extra stream: the ultrawide lens for the area around the frame.
+        val uwId = uwPhysicalId
+        val useBg = !useMax && bgAllowed && bgSurfaceReady && uwId != null
+        val allOutputs = if (useBg && uwId != null) {
+            outputs + OutputConfiguration(bgSurfaceView.holder.surface).apply { setPhysicalCameraId(uwId) }
+        } else {
+            outputs
+        }
+        fun dropBgAndRetry(why: String) {
+            logFailure("Ultrawide fill not available: $why")
+            bgAllowed = false
+            reader?.close()
+            maxReader?.close()
+            photoReader = null
+            maxResReader = null
+            startPhotoSession()
+        }
         photoReader = reader
         maxResReader = maxReader
 
         val params = photoRequestBuilder(cam)
         val config = SessionConfiguration(
             SessionConfiguration.SESSION_REGULAR,
-            outputs,
+            allOutputs,
             cameraExecutor,
             object : CameraCaptureSession.StateCallback() {
                 override fun onConfigured(s: CameraCaptureSession) {
@@ -1657,8 +1811,10 @@ class MainActivity : Activity() {
                         return
                     }
                     session = s
+                    bgActive = useBg
                     setRepeating(withRecord = false)
                     mainHandler.post {
+                        positionBackground()
                         applyFrameRateHint(photoFpsRange.upper)
                         window.colorMode = ActivityInfo.COLOR_MODE_DEFAULT
                         updateButtons()
@@ -1667,7 +1823,9 @@ class MainActivity : Activity() {
                 }
 
                 override fun onConfigureFailed(s: CameraCaptureSession) {
-                    if (useMax) {
+                    if (useBg) {
+                        dropBgAndRetry("the camera rejected the extra ultrawide stream")
+                    } else if (useMax) {
                         fiftyMpOn = false
                         toast("50 MP mode isn't available to apps on this camera")
                         startPhotoSession()
@@ -1679,8 +1837,19 @@ class MainActivity : Activity() {
         )
         config.setSessionParameters(params.build())
         try {
+            if (useBg) {
+                val supported = try { cam.isSessionConfigurationSupported(config) } catch (e: Exception) { true }
+                if (!supported) {
+                    dropBgAndRetry("the camera reports the extra ultrawide stream as unsupported")
+                    return
+                }
+            }
             cam.createCaptureSession(config)
         } catch (e: Exception) {
+            if (useBg) {
+                dropBgAndRetry("${e.javaClass.simpleName} ${e.message}")
+                return
+            }
             Log.e(TAG, "photo session failed", e)
             showStatus("Photo mode failed to start: ${e.message}")
         }
