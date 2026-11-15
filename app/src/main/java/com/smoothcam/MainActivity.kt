@@ -1407,8 +1407,14 @@ class MainActivity : Activity() {
             sb.append("\nRecent camera refusals:\n")
             failures.forEach { sb.append("• ").append(it).append("\n") }
         }
+        val version = try {
+            val info = packageManager.getPackageInfo(packageName, 0)
+            "${info.versionName} (build ${info.longVersionCode})"
+        } catch (e: Exception) {
+            "?"
+        }
         AlertDialog.Builder(this)
-            .setTitle("Camera info")
+            .setTitle("SmoothCam $version · Camera info")
             .setMessage(sb.toString())
             .setPositiveButton("OK", null)
             .show()

@@ -13,8 +13,10 @@ android {
         applicationId = "com.smoothcam"
         minSdk = 33
         targetSdk = 35
-        versionCode = 4
-        versionName = "0.4"
+        // Version: set versionName by hand when releasing a new version.
+        // versionCode comes from the cloud build number, so every APK installs over the previous one.
+        versionCode = System.getenv("GITHUB_RUN_NUMBER")?.toIntOrNull() ?: 1
+        versionName = "0.5"
     }
 
     buildTypes {
