@@ -2,11 +2,14 @@ package com.smoothcam
 
 import android.content.ContentValues
 import android.content.Context
+import android.graphics.Bitmap
 import android.graphics.ImageFormat
+import android.graphics.Matrix
 import android.graphics.Rect
 import android.graphics.YuvImage
 import android.media.ExifInterface
 import android.media.Image
+import android.net.Uri
 import android.os.Environment
 import android.provider.MediaStore
 import android.util.Log
@@ -58,39 +61,78 @@ object PhotoProcessor {
 
     private val threadCount = max(2, Runtime.getRuntime().availableProcessors())
 
-    /** frames[0] must be the newest frame (the moment the shutter was pressed). */
-    fun processAndSave(context: Context, frames: List<Image>, iso: Int, orientationDeg: Int): Boolean {
+    /** A camera frame copied out of its Image, so the camera's buffer can be returned at once. */
+    class YuvFrame(val width: Int, val height: Int, val y: ByteArray, val u: ByteArray, val v: ByteArray) {
+        companion object {
+            fun copyOf(img: Image): YuvFrame {
+                val w = img.width
+                val h = img.height
+                val y = ByteArray(w * h)
+                val u = ByteArray((w / 2) * (h / 2))
+                val v = ByteArray((w / 2) * (h / 2))
+                PhotoProcessor.copyPlane(img.planes[0], w, h, y)
+                PhotoProcessor.copyPlane(img.planes[1], w / 2, h / 2, u)
+                PhotoProcessor.copyPlane(img.planes[2], w / 2, h / 2, v)
+                return YuvFrame(w, h, y, u, v)
+            }
+        }
+    }
+
+    /**
+     * frames[0] must be the newest frame (the moment the shutter was pressed).
+     * Returns the saved photo's content URI. The frames' arrays are reused as scratch space.
+     */
+    fun processAndSave(context: Context, frames: List<YuvFrame>, iso: Int, orientationDeg: Int): Uri {
         val w = frames[0].width
         val h = frames[0].height
         val nv21 = render(frames, iso)
-        save(context, nv21, w, h, orientationDeg)
-        return true
+        return save(context, nv21, w, h, orientationDeg)
+    }
+
+    /** A small, quickly made preview of a frame for the gallery button (nearest-neighbour, no look applied). */
+    fun quickThumbnail(f: YuvFrame, orientationDeg: Int, size: Int = 160): Bitmap {
+        val scale = max(1, min(f.width, f.height) / size)
+        val tw = f.width / scale
+        val th = f.height / scale
+        val px = IntArray(tw * th)
+        val cw = f.width / 2
+        for (ty in 0 until th) {
+            val sy = ty * scale
+            for (tx in 0 until tw) {
+                val sx = tx * scale
+                val yy = (f.y[sy * f.width + sx].toInt() and 0xFF).toFloat()
+                val ci = (sy / 2) * cw + sx / 2
+                val u = (f.u[ci].toInt() and 0xFF) - 128f
+                val v = (f.v[ci].toInt() and 0xFF) - 128f
+                val r = (yy + 1.402f * v).toInt().coerceIn(0, 255)
+                val g = (yy - 0.344136f * u - 0.714136f * v).toInt().coerceIn(0, 255)
+                val b = (yy + 1.772f * u).toInt().coerceIn(0, 255)
+                px[ty * tw + tx] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
+            }
+        }
+        val bmp = Bitmap.createBitmap(px, tw, th, Bitmap.Config.ARGB_8888)
+        if (orientationDeg == 0) return bmp
+        val m = Matrix().apply { postRotate(orientationDeg.toFloat()) }
+        return Bitmap.createBitmap(bmp, 0, 0, tw, th, m, true)
     }
 
     // ---------------------------------------------------------------- merge
 
-    private fun render(frames: List<Image>, iso: Int): ByteArray {
+    private fun render(frames: List<YuvFrame>, iso: Int): ByteArray {
         val ref = frames[0]
         val w = ref.width
         val h = ref.height
         val cw = w / 2
         val ch = h / 2
-
-        val refY = ByteArray(w * h)
-        val refU = ByteArray(cw * ch)
-        val refV = ByteArray(cw * ch)
-        copyPlane(ref.planes[0], w, h, refY)
-        copyPlane(ref.planes[1], cw, ch, refU)
-        copyPlane(ref.planes[2], cw, ch, refV)
+        val refY = ref.y
+        val refU = ref.u
+        val refV = ref.v
 
         val n = frames.size
         if (n > 1) {
-            val ySum = ShortArray(w * h) { (refY[it].toInt() and 0xFF).toShort() }
-            val uSum = ShortArray(cw * ch) { (refU[it].toInt() and 0xFF).toShort() }
-            val vSum = ShortArray(cw * ch) { (refV[it].toInt() and 0xFF).toShort() }
-            val tmpY = ByteArray(w * h)
-            val tmpU = ByteArray(cw * ch)
-            val tmpV = ByteArray(cw * ch)
+            val ySum = toShorts(refY)
+            val uSum = toShorts(refU)
+            val vSum = toShorts(refV)
 
             // Higher ISO = more noise = allow larger differences before treating a pixel as "moved".
             val tY = (12 + iso / 80).coerceIn(12, 48)
@@ -102,18 +144,15 @@ object PhotoProcessor {
 
             for (k in 1 until n) {
                 val f = frames[k]
-                copyPlane(f.planes[0], w, h, tmpY)
-                copyPlane(f.planes[1], cw, ch, tmpU)
-                copyPlane(f.planes[2], cw, ch, tmpV)
-
-                val small = downscale(tmpY, w, h, 8)
+                if (f.width != w || f.height != h) continue
+                val small = downscale(f.y, w, h, 8)
                 val coarse = searchCoarse(refSmall, small, sw, sh, 4)
-                val (dx, dy) = searchFine(refY, tmpY, w, h, coarse.first * 8, coarse.second * 8, 6)
+                val (dx, dy) = searchFine(refY, f.y, w, h, coarse.first * 8, coarse.second * 8, 6)
                 Log.d(TAG, "frame $k shift dx=$dx dy=$dy")
 
-                accumulate(refY, tmpY, ySum, w, h, dx, dy, tY)
-                accumulate(refU, tmpU, uSum, cw, ch, dx / 2, dy / 2, tC)
-                accumulate(refV, tmpV, vSum, cw, ch, dx / 2, dy / 2, tC)
+                accumulate(refY, f.y, ySum, w, h, dx, dy, tY)
+                accumulate(refU, f.u, uSum, cw, ch, dx / 2, dy / 2, tC)
+                accumulate(refV, f.v, vSum, cw, ch, dx / 2, dy / 2, tC)
             }
             average(ySum, refY, n)
             average(uSum, refU, n)
@@ -123,8 +162,18 @@ object PhotoProcessor {
         return toneMapToNv21(refY, refU, refV, w, h)
     }
 
+    private fun toShorts(src: ByteArray): ShortArray {
+        val out = ShortArray(src.size)
+        val rows = 64
+        parallelRows((src.size + rows - 1) / rows) { r0, r1 ->
+            val end = min(src.size, r1 * rows)
+            for (i in r0 * rows until end) out[i] = (src[i].toInt() and 0xFF).toShort()
+        }
+        return out
+    }
+
     /** Copies an Image plane into a tightly packed array, handling row and pixel strides. */
-    private fun copyPlane(plane: Image.Plane, w: Int, h: Int, out: ByteArray) {
+    internal fun copyPlane(plane: Image.Plane, w: Int, h: Int, out: ByteArray) {
         val rowStride = plane.rowStride
         val ps = plane.pixelStride
         val src = plane.buffer
@@ -236,7 +285,11 @@ object PhotoProcessor {
     }
 
     private fun average(sum: ShortArray, out: ByteArray, n: Int) {
-        for (i in sum.indices) out[i] = ((sum[i] + n / 2) / n).toByte()
+        val rows = 64
+        parallelRows((sum.size + rows - 1) / rows) { r0, r1 ->
+            val end = min(sum.size, r1 * rows)
+            for (i in r0 * rows until end) out[i] = ((sum[i] + n / 2) / n).toByte()
+        }
     }
 
     // ---------------------------------------------------------------- look
@@ -396,8 +449,8 @@ object PhotoProcessor {
 
     // ---------------------------------------------------------------- output
 
-    private fun save(context: Context, nv21: ByteArray, w: Int, h: Int, orientationDeg: Int) {
-        val tmp = File(context.cacheDir, "photo_tmp.jpg")
+    private fun save(context: Context, nv21: ByteArray, w: Int, h: Int, orientationDeg: Int): Uri {
+        val tmp = File.createTempFile("photo", ".jpg", context.cacheDir)
         FileOutputStream(tmp).use {
             YuvImage(nv21, ImageFormat.NV21, w, h, null).compressToJpeg(Rect(0, 0, w, h), JPEG_QUALITY, it)
         }
@@ -437,6 +490,7 @@ object PhotoProcessor {
         } finally {
             tmp.delete()
         }
+        return uri
     }
 
     // ---------------------------------------------------------------- threading

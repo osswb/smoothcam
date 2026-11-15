@@ -4,9 +4,12 @@ import android.Manifest
 import android.annotation.SuppressLint
 import android.app.Activity
 import android.app.AlertDialog
+import android.content.ContentUris
 import android.content.ContentValues
+import android.content.Intent
 import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.ImageFormat
 import android.graphics.drawable.GradientDrawable
@@ -51,6 +54,7 @@ import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
 import android.widget.Button
+import android.widget.ImageView
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.PopupMenu
@@ -67,6 +71,7 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executor
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.abs
 import kotlin.math.roundToInt
 
@@ -137,8 +142,14 @@ class MainActivity : Activity() {
     private var maxResIso = 0
     private var maxResOrientation = 0
     private val zslRing = ArrayDeque<Image>()     // most recent frames, newest last
-    @Volatile private var processingPhoto = false
-    private val photoExecutor = Executors.newSingleThreadExecutor()
+    @Volatile private var processingPhoto = false  // camera buffers still held for the last shot
+    private val photoExecutor = Executors.newSingleThreadExecutor() // look + JPEG, one photo at a time
+    private val copyExecutor = Executors.newSingleThreadExecutor()  // copies frames out of camera buffers
+    private val shotsInFlight = AtomicInteger(0)                    // taken but not saved yet
+
+    // Gallery button
+    @Volatile private var lastMediaUri: Uri? = null
+    @Volatile private var lastMediaMime = "image/jpeg"
 
     // Mode switching (main thread)
     private var switching = false
@@ -188,7 +199,10 @@ class MainActivity : Activity() {
     private lateinit var videoSettings: LinearLayout
     private lateinit var resLabel: TextView
     private lateinit var fpsLabel: TextView
-    private lateinit var lensRow: LinearLayout
+    private lateinit var lensRow: DragRowLayout
+    private lateinit var chipRow: LinearLayout
+    private lateinit var zoomDial: ZoomDialView
+    private lateinit var thumbView: ImageView
     private val lensButtons = mutableListOf<TextView>()
     private lateinit var evChip: TextView
     private lateinit var shutterChip: TextView
@@ -238,6 +252,7 @@ class MainActivity : Activity() {
         resumed = true
         orientationListener?.enable()
         maybeStartCamera()
+        if (shotsInFlight.get() == 0) copyExecutor.execute { loadLatestMedia() }
     }
 
     override fun onPause() {
@@ -259,6 +274,7 @@ class MainActivity : Activity() {
         }
         cameraThread.quitSafely()
         photoExecutor.shutdown()
+        copyExecutor.shutdown()
         super.onDestroy()
     }
 
@@ -843,6 +859,7 @@ class MainActivity : Activity() {
             if (ok) {
                 val done = ContentValues().apply { put(MediaStore.Video.Media.IS_PENDING, 0) }
                 contentResolver.update(uri, done, null, null)
+                copyExecutor.execute { showMediaThumbnail(uri, "video/mp4") }
             } else {
                 contentResolver.delete(uri, null, null)
             }
@@ -870,6 +887,7 @@ class MainActivity : Activity() {
         val scaleDetector = ScaleGestureDetector(this, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
             override fun onScale(detector: ScaleGestureDetector): Boolean {
                 setZoom(zoomRatio * detector.scaleFactor)
+                if (zoomPresets.size > 1) zoomDial.show()
                 return true
             }
         })
@@ -950,8 +968,9 @@ class MainActivity : Activity() {
         }
         resLabel = settingLabel().apply { setOnClickListener { showResolutionMenu(it) } }
         fpsLabel = settingLabel().apply { setOnClickListener { showFpsMenu(it) } }
-        videoSettings.addView(resLabel, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(34)))
-        videoSettings.addView(fpsLabel, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(34)).apply {
+        videoSettings.clipChildren = false
+        videoSettings.addView(resLabel, LinearLayout.LayoutParams(dp(50), dp(50)))
+        videoSettings.addView(fpsLabel, LinearLayout.LayoutParams(dp(50), dp(50)).apply {
             leftMargin = dp(8)
         })
         root.addView(videoSettings, FrameLayout.LayoutParams(
@@ -960,8 +979,9 @@ class MainActivity : Activity() {
         ).apply { topMargin = dp(92); rightMargin = dp(16) })
 
         // Lens / zoom presets (0.5x, 1x, 2x, 5x...). Pinch works too.
-        lensRow = LinearLayout(this).apply {
+        lensRow = DragRowLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
+            clipChildren = false
             gravity = Gravity.CENTER
             setPadding(dp(4), dp(4), dp(4), dp(4))
             background = GradientDrawable().apply {
@@ -975,6 +995,10 @@ class MainActivity : Activity() {
                 textSize = 12f
                 setTextColor(Color.WHITE)
                 setOnClickListener { setZoom(z) }
+                setOnLongClickListener {
+                    zoomDial.show()
+                    true
+                }
             }
             lensButtons += t
             lensRow.addView(t, LinearLayout.LayoutParams(dp(40), dp(40)).apply {
@@ -988,22 +1012,23 @@ class MainActivity : Activity() {
         ).apply { bottomMargin = dp(194) })
 
         // Manual exposure: tap a chip to open its slider, long-press to reset it to auto.
-        val chipRow = LinearLayout(this).apply {
+        chipRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
+            clipChildren = false
         }
         evChip = chip("ev")
         shutterChip = chip("s")
         isoChip = chip("iso")
         for (c in listOf(evChip, shutterChip, isoChip)) {
-            chipRow.addView(c, LinearLayout.LayoutParams(dp(96), dp(34)).apply {
-                leftMargin = dp(4); rightMargin = dp(4)
+            chipRow.addView(c, LinearLayout.LayoutParams(dp(60), dp(60)).apply {
+                leftMargin = dp(6); rightMargin = dp(6)
             })
         }
         root.addView(chipRow, FrameLayout.LayoutParams(
             ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
             Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
-        ).apply { bottomMargin = dp(248) })
+        ).apply { bottomMargin = dp(246) })
 
         sliderPanel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -1033,7 +1058,7 @@ class MainActivity : Activity() {
         root.addView(sliderPanel, FrameLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
             Gravity.BOTTOM
-        ).apply { bottomMargin = dp(292); leftMargin = dp(24); rightMargin = dp(24) })
+        ).apply { bottomMargin = dp(318); leftMargin = dp(24); rightMargin = dp(24) })
 
         hdrButton = pillButton().apply {
             setOnClickListener { cameraHandler.post { toggleHdr() } }
@@ -1065,9 +1090,49 @@ class MainActivity : Activity() {
             Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
         ).apply { bottomMargin = dp(146) })
 
+        // Zoom dial: appears when you drag across or long-press the lens buttons, or pinch.
+        zoomDial = ZoomDialView(this).apply {
+            minZoom = zoomRange.lower
+            maxZoom = zoomRange.upper
+            presets = zoomPresets.toList()
+            zoom = zoomRatio
+            visibility = View.GONE
+            onZoomChanged = { z -> setZoom(z) }
+            onShown = {
+                lensRow.animate().alpha(0f).setDuration(120).start()
+                chipRow.animate().alpha(0f).setDuration(120).start()
+            }
+            onHidden = {
+                lensRow.animate().alpha(1f).setDuration(150).start()
+                chipRow.animate().alpha(1f).setDuration(150).start()
+            }
+        }
+        root.addView(zoomDial, FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, dp(150), Gravity.BOTTOM
+        ).apply { bottomMargin = dp(186) })
+        lensRow.onDragStart = { x -> zoomDial.beginDrag(x) }
+        lensRow.onDragMove = { x -> zoomDial.dragTo(x) }
+
+        // Gallery button: newest photo/video from this app; tap to open it.
+        thumbView = ImageView(this).apply {
+            scaleType = ImageView.ScaleType.CENTER_CROP
+            background = GradientDrawable().apply {
+                setColor(Color.argb(160, 40, 40, 40))
+                cornerRadius = dp(10).toFloat()
+                setStroke(dp(2), Color.WHITE)
+            }
+            clipToOutline = true
+            setPadding(dp(2), dp(2), dp(2), dp(2))
+            setOnClickListener { openLastMedia() }
+        }
+        root.addView(thumbView, FrameLayout.LayoutParams(dp(54), dp(54),
+            Gravity.BOTTOM or Gravity.START
+        ).apply { bottomMargin = dp(67); leftMargin = dp(36) })
+
         setContentView(root)
-        rotatables += listOf(recText, hdrButton, maxResButton, resLabel, fpsLabel, evChip, shutterChip, isoChip,
-            photoTab, videoTab, sliderLabel)
+        // Only compact (square or round) controls turn with the phone; the PHOTO/VIDEO labels and the
+        // slider stay put, as on iPhone.
+        rotatables += listOf(recText, hdrButton, maxResButton, resLabel, fpsLabel, evChip, shutterChip, isoChip, thumbView)
         rotatables += lensButtons
         styleRecordButton(false)
         updateButtons()
@@ -1075,13 +1140,13 @@ class MainActivity : Activity() {
 
     private fun settingLabel() = TextView(this).apply {
         gravity = Gravity.CENTER
-        textSize = 14f
+        textSize = 13f
         setTypeface(typeface, android.graphics.Typeface.BOLD)
         setTextColor(Color.WHITE)
-        setPadding(dp(12), 0, dp(12), 0)
+        setPadding(0, 0, 0, 0)
         background = GradientDrawable().apply {
             setColor(Color.argb(140, 0, 0, 0))
-            cornerRadius = dp(17).toFloat()
+            cornerRadius = dp(14).toFloat()
             setStroke(dp(1), Color.argb(120, 255, 255, 255))
         }
     }
@@ -1215,6 +1280,7 @@ class MainActivity : Activity() {
     /** Main thread. */
     private fun setZoom(z: Float) {
         zoomRatio = z.coerceIn(zoomRange.lower, zoomRange.upper)
+        zoomDial.zoom = zoomRatio
         updateLensButtons()
         requestRepeatingUpdate()
     }
@@ -1308,9 +1374,9 @@ class MainActivity : Activity() {
     private fun updateChips() {
         val fps = currentFps()
         val sAuto = exposure.shutter == ExposureControl.Shutter.Auto
-        val evText = "EV ${exposure.evLabel(exposure.evIndex)}"
-        val sText = if (sAuto) "S Auto" else "S ${exposure.shutterLabel(exposure.shutter, fps).substringBefore(" (")}"
-        val isoText = exposure.iso?.let { "ISO $it" } ?: "ISO Auto"
+        val evText = "EV\n${exposure.evLabel(exposure.evIndex)}"
+        val sText = if (sAuto) "S\nAuto" else "S\n${exposure.shutterLabel(exposure.shutter, fps).substringBefore(" (")}"
+        val isoText = exposure.iso?.let { "ISO\n$it" } ?: "ISO\nAuto"
         styleChip(evChip, evText, exposure.evIndex != 0, exposure.evActive)
         styleChip(shutterChip, sText, !sAuto, true)
         styleChip(isoChip, isoText, exposure.iso != null, true)
@@ -1341,7 +1407,7 @@ class MainActivity : Activity() {
         c.alpha = if (enabled) 1f else 0.45f
         c.background = GradientDrawable().apply {
             setColor(if (selected) Color.argb(220, 40, 40, 40) else Color.argb(130, 0, 0, 0))
-            cornerRadius = dp(17).toFloat()
+            cornerRadius = dp(14).toFloat()
             setStroke(dp(1), if (selected) Color.rgb(255, 196, 0) else Color.argb(90, 255, 255, 255))
         }
     }
@@ -1635,6 +1701,7 @@ class MainActivity : Activity() {
             // A 50 MP shot was in flight and will never arrive now; nothing holds its frames yet.
             awaitingMaxRes = false
             processingPhoto = false
+            shotsInFlight.decrementAndGet()
             mainHandler.post { showProcessing(false) }
         }
         for (r in listOfNotNull(photoReader, maxResReader)) {
@@ -1650,15 +1717,26 @@ class MainActivity : Activity() {
         pendingReaderClose.clear()
     }
 
-    /** Camera thread. */
+    /**
+     * Camera thread. Shooting is instant: the frames are copied out of the camera's buffers right
+     * away (about a tenth of a second) and processed in the background, so you can keep shooting.
+     */
     private fun takePhoto() {
         if (!photoMode || session == null) return
         if (processingPhoto) {
-            toast("Still processing the last photo")
+            toast("One moment…")
             return
         }
         if (maxResReader != null) {
+            if (shotsInFlight.get() > 0) {
+                toast("Wait for the last photo to finish saving")
+                return
+            }
             takeMaxResPhoto()
+            return
+        }
+        if (shotsInFlight.get() >= MAX_QUEUED_SHOTS) {
+            toast("Still saving the last photos…")
             return
         }
         if (zslRing.isEmpty()) {
@@ -1669,6 +1747,7 @@ class MainActivity : Activity() {
         while (zslRing.isNotEmpty() && frames.size < PHOTO_BURST) frames.add(zslRing.removeLast()) // newest first
         while (zslRing.isNotEmpty()) zslRing.removeFirst().close()
         processingPhoto = true
+        shotsInFlight.incrementAndGet()
         val iso = lastIso
         val orientation = (sensorOrientation + deviceOrientation) % 360
         mainHandler.post {
@@ -1684,6 +1763,7 @@ class MainActivity : Activity() {
         val s = session ?: return
         val mr = maxResReader ?: return
         processingPhoto = true
+        shotsInFlight.incrementAndGet()
         awaitingMaxRes = true
         maxResIso = lastIso
         maxResOrientation = (sensorOrientation + deviceOrientation) % 360
@@ -1718,6 +1798,7 @@ class MainActivity : Activity() {
         if (!awaitingMaxRes) return
         awaitingMaxRes = false
         processingPhoto = false
+        shotsInFlight.decrementAndGet()
         closePendingReaders()
         mainHandler.post { showProcessing(false) }
         toast(msg)
@@ -1734,14 +1815,18 @@ class MainActivity : Activity() {
         processFrames(listOf(img), maxResIso, maxResOrientation)
     }
 
-    /** Hands frames to the photo thread; they are closed when processing is done. */
+    /**
+     * Copies the frames out of the camera's buffers (and returns the buffers), shows a quick
+     * thumbnail, then queues the real processing. Takes ownership of the Images.
+     */
     private fun processFrames(frames: List<Image>, iso: Int, orientation: Int) {
-        photoExecutor.execute {
-            val ok = try {
-                PhotoProcessor.processAndSave(this, frames, iso, orientation)
+        val t0 = SystemClock.elapsedRealtime()
+        copyExecutor.execute {
+            val copies = try {
+                frames.map { PhotoProcessor.YuvFrame.copyOf(it) }
             } catch (e: Throwable) {
-                Log.e(TAG, "photo processing failed", e)
-                false
+                Log.e(TAG, "copying frames failed", e)
+                null
             } finally {
                 frames.forEach { try { it.close() } catch (e: Exception) { /* ignore */ } }
             }
@@ -1749,8 +1834,35 @@ class MainActivity : Activity() {
                 processingPhoto = false
                 closePendingReaders()
             }
-            mainHandler.post { showProcessing(false) }
-            toast(if (ok) "Saved to Pictures/SmoothCam" else "Couldn't save the photo")
+            if (copies == null) {
+                shotsInFlight.decrementAndGet()
+                mainHandler.post { showProcessing(false) }
+                toast("Couldn't capture the photo")
+                return@execute
+            }
+            try {
+                val thumb = PhotoProcessor.quickThumbnail(copies[0], orientation)
+                mainHandler.post { setThumbnail(thumb) }
+            } catch (e: Throwable) {
+                Log.w(TAG, "quick thumbnail failed", e)
+            }
+            photoExecutor.execute {
+                val uri = try {
+                    PhotoProcessor.processAndSave(this, copies, iso, orientation)
+                } catch (e: Throwable) {
+                    Log.e(TAG, "photo processing failed", e)
+                    null
+                }
+                val secs = (SystemClock.elapsedRealtime() - t0) / 1000.0
+                Log.i(TAG, String.format(Locale.US, "photo saved in %.2f s", secs))
+                shotsInFlight.decrementAndGet()
+                if (uri != null) {
+                    lastMediaUri = uri
+                    lastMediaMime = "image/jpeg"
+                }
+                mainHandler.post { showProcessing(false) }
+                if (uri == null) toast("Couldn't save the photo")
+            }
         }
     }
 
@@ -1759,10 +1871,13 @@ class MainActivity : Activity() {
         surfaceView.animate().alpha(1f).setDuration(180).start()
     }
 
+    /** Main thread. Small "Saving…" badge while photos are being processed in the background. */
+    @Suppress("UNUSED_PARAMETER")
     private fun showProcessing(on: Boolean) {
         if (recording) return
-        if (on) {
-            recText.text = "Processing…"
+        val n = shotsInFlight.get()
+        if (n > 0) {
+            recText.text = if (n > 1) "Saving $n photos…" else "Saving…"
             recText.background = GradientDrawable().apply {
                 setColor(Color.argb(170, 0, 0, 0))
                 cornerRadius = dp(8).toFloat()
@@ -1774,6 +1889,67 @@ class MainActivity : Activity() {
                 setColor(Color.rgb(200, 30, 30))
                 cornerRadius = dp(8).toFloat()
             }
+        }
+    }
+
+    // ---------------------------------------------------------------- gallery button
+
+    private fun setThumbnail(bmp: Bitmap?) {
+        if (bmp == null) {
+            thumbView.setImageDrawable(null)
+            return
+        }
+        thumbView.setImageBitmap(bmp)
+        thumbView.scaleX = 0.85f
+        thumbView.scaleY = 0.85f
+        thumbView.animate().scaleX(1f).scaleY(1f).setDuration(180).start()
+    }
+
+    /** Background thread. Find the newest photo or video this app saved and show it on the gallery button. */
+    private fun loadLatestMedia() {
+        try {
+            fun newest(collection: Uri, dateCol: String, pathCol: String): Pair<Uri, Long>? {
+                contentResolver.query(
+                    collection, arrayOf(MediaStore.MediaColumns._ID, dateCol),
+                    "$pathCol LIKE ?", arrayOf("%SmoothCam%"), "$dateCol DESC"
+                )?.use { c ->
+                    if (c.moveToFirst()) return ContentUris.withAppendedId(collection, c.getLong(0)) to c.getLong(1)
+                }
+                return null
+            }
+            val img = newest(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, MediaStore.Images.Media.DATE_ADDED,
+                MediaStore.Images.Media.RELATIVE_PATH)
+            val vid = newest(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, MediaStore.Video.Media.DATE_ADDED,
+                MediaStore.Video.Media.RELATIVE_PATH)
+            val pick = listOfNotNull(img?.let { Triple(it.first, it.second, "image/jpeg") },
+                vid?.let { Triple(it.first, it.second, "video/mp4") }).maxByOrNull { it.second } ?: return
+            showMediaThumbnail(pick.first, pick.third)
+        } catch (e: Exception) {
+            Log.w(TAG, "couldn't load latest media", e)
+        }
+    }
+
+    /** Background thread. */
+    private fun showMediaThumbnail(uri: Uri, mime: String) {
+        lastMediaUri = uri
+        lastMediaMime = mime
+        val bmp = try { contentResolver.loadThumbnail(uri, Size(160, 160), null) } catch (e: Exception) { null }
+        mainHandler.post { setThumbnail(bmp) }
+    }
+
+    private fun openLastMedia() {
+        val uri = lastMediaUri
+        if (uri == null) {
+            toast(if (shotsInFlight.get() > 0) "Still saving…" else "No photos or videos yet")
+            return
+        }
+        val intent = Intent(Intent.ACTION_VIEW)
+            .setDataAndType(uri, lastMediaMime)
+            .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        try {
+            startActivity(intent)
+        } catch (e: Exception) {
+            toast("No gallery app found to open it")
         }
     }
 
@@ -1802,5 +1978,6 @@ class MainActivity : Activity() {
         private const val ZSL_MAX_IMAGES = 9  // camera buffers for the full-res stream
         private const val ZSL_RING = 4        // frames kept for the next shot
         private const val PHOTO_BURST = 4     // frames merged per photo
+        private const val MAX_QUEUED_SHOTS = 3 // photos waiting to be saved (each holds ~75 MB)
     }
 }

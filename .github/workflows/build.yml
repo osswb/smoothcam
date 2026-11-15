@@ -39,13 +39,13 @@ jobs:
             echo "::warning::SIGNING_KEYSTORE_BASE64 secret is missing: this APK uses a throwaway key and cannot update an installed SmoothCam."
           fi
 
-      - name: Build debug APK
+      - name: Build release APK
         env:
           SIGNING_PASSWORD: ${{ secrets.SIGNING_PASSWORD }}
         run: |
           chmod +x gradlew
-          ./gradlew assembleDebug --stacktrace
-          cp app/build/outputs/apk/debug/app-debug.apk "SmoothCam-$VERSION.apk"
+          ./gradlew assembleRelease --stacktrace
+          cp app/build/outputs/apk/release/app-release.apk "SmoothCam-$VERSION.apk"
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4

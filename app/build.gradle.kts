@@ -16,7 +16,7 @@ android {
         // Version = "<baseVersion>.<build number>", e.g. 0.5.7. Raise baseVersion by hand for a new
         // version; the build number comes from the cloud build, so every build is a newer version.
         // The release tag uses the same string (v0.5.7), which is what update checkers like Obtainium compare.
-        val baseVersion = "0.5"
+        val baseVersion = "0.6"
         val buildNumber = System.getenv("GITHUB_RUN_NUMBER")?.toIntOrNull() ?: 0
         versionCode = maxOf(buildNumber, 1)
         versionName = "$baseVersion.$buildNumber"
@@ -42,9 +42,22 @@ android {
         debug {
             if (keystorePath != null) signingConfig = signingConfigs.getByName("stable")
         }
+        // The APK we ship is a release build: debug builds are "debuggable", which makes Android
+        // run the app's own code (like photo processing) many times slower.
         release {
             isMinifyEnabled = false
+            signingConfig = if (keystorePath != null) {
+                signingConfigs.getByName("stable")
+            } else {
+                signingConfigs.getByName("debug") // local builds without the secret still install
+            }
         }
+    }
+
+    lint {
+        // Don't let lint warnings stop a release build.
+        checkReleaseBuilds = false
+        abortOnError = false
     }
 
     compileOptions {
