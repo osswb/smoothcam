@@ -67,9 +67,10 @@ object RawProcessor {
         val boost: Float,             // brightness to restore (2^underexposure stops)
         val zoom: Float,              // centre crop factor (RAW isn't cropped by the camera's zoom)
         val iso: Int,
+        val aspect: Int,              // 0 = 4:3, 1 = 16:9, 2 = 1:1
     ) {
         companion object {
-            fun from(chars: CameraCharacteristics, r: CaptureResult, boost: Float, zoom: Float): Meta {
+            fun from(chars: CameraCharacteristics, r: CaptureResult, boost: Float, zoom: Float, aspect: Int): Meta {
                 val cfa = chars.get(CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT)
                     ?: CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT_RGGB
                 val dyn = r.get(CaptureResult.SENSOR_DYNAMIC_BLACK_LEVEL)
@@ -95,7 +96,7 @@ object RawProcessor {
                 return Meta(
                     cfa, black, white, wb, ccm,
                     r.get(CaptureResult.STATISTICS_LENS_SHADING_CORRECTION_MAP),
-                    s, o, boost, zoom, r.get(CaptureResult.SENSOR_SENSITIVITY) ?: 100
+                    s, o, boost, zoom, r.get(CaptureResult.SENSOR_SENSITIVITY) ?: 100, aspect
                 )
             }
         }
@@ -343,8 +344,12 @@ object RawProcessor {
     private fun develop(p: FloatArray, w: Int, h: Int, meta: Meta): Yuv {
         // Centre crop for zoom (RAW isn't cropped by the camera), kept on even pixels.
         val z = max(1f, meta.zoom)
-        val cw = ((w / z).toInt() / 2) * 2
-        val chh = ((h / z).toInt() / 2) * 2
+        var cw = ((w / z).toInt() / 2) * 2
+        var chh = ((h / z).toInt() / 2) * 2
+        when (meta.aspect) {
+            1 -> chh = min(chh, (cw * 9 / 16) / 2 * 2)
+            2 -> cw = min(cw, chh)
+        }
         val ox = ((w - cw) / 4) * 2
         val oy = ((h - chh) / 4) * 2
 

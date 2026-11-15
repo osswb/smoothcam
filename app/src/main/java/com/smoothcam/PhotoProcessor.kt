@@ -82,11 +82,44 @@ object PhotoProcessor {
      * frames[0] must be the newest frame (the moment the shutter was pressed).
      * Returns the saved photo's content URI. The frames' arrays are reused as scratch space.
      */
-    fun processAndSave(context: Context, frames: List<YuvFrame>, iso: Int, orientationDeg: Int): Uri {
+    fun processAndSave(context: Context, frames: List<YuvFrame>, iso: Int, orientationDeg: Int, aspect: Int = 0): Uri {
         val w = frames[0].width
         val h = frames[0].height
-        val nv21 = render(frames, iso)
-        return save(context, nv21, w, h, orientationDeg)
+        merge(frames, iso)
+        val ref = frames[0]
+        val c = cropToAspect(ref.y, ref.u, ref.v, w, h, aspect)
+        val nv21 = toneMapToNv21(c.y, c.u, c.v, c.w, c.h)
+        return save(context, nv21, c.w, c.h, orientationDeg)
+    }
+
+    class Planes(val y: ByteArray, val u: ByteArray, val v: ByteArray, val w: Int, val h: Int)
+
+    /**
+     * Centre crop to the photo aspect ratio (0 = 4:3, 1 = 16:9, 2 = 1:1). Works on the sensor's
+     * landscape buffer, so a 16:9 crop gives a 9:16 photo when the phone is held upright.
+     */
+    fun cropToAspect(y: ByteArray, u: ByteArray, v: ByteArray, w: Int, h: Int, aspect: Int): Planes {
+        var cw = w
+        var ch = h
+        when (aspect) {
+            1 -> ch = min(h, (w * 9 / 16) / 2 * 2)
+            2 -> cw = min(w, h / 2 * 2)
+        }
+        if (cw == w && ch == h) return Planes(y, u, v, w, h)
+        val ox = ((w - cw) / 4) * 2
+        val oy = ((h - ch) / 4) * 2
+        val ny = ByteArray(cw * ch)
+        for (r in 0 until ch) System.arraycopy(y, (oy + r) * w + ox, ny, r * cw, cw)
+        val w2 = w / 2
+        val cw2 = cw / 2
+        val ch2 = ch / 2
+        val nu = ByteArray(cw2 * ch2)
+        val nv = ByteArray(cw2 * ch2)
+        for (r in 0 until ch2) {
+            System.arraycopy(u, (oy / 2 + r) * w2 + ox / 2, nu, r * cw2, cw2)
+            System.arraycopy(v, (oy / 2 + r) * w2 + ox / 2, nv, r * cw2, cw2)
+        }
+        return Planes(ny, nu, nv, cw, ch)
     }
 
     /**
@@ -128,7 +161,8 @@ object PhotoProcessor {
 
     // ---------------------------------------------------------------- merge
 
-    private fun render(frames: List<YuvFrame>, iso: Int): ByteArray {
+    /** Merges the frames into frames[0] (in place). */
+    private fun merge(frames: List<YuvFrame>, iso: Int) {
         val ref = frames[0]
         val w = ref.width
         val h = ref.height
@@ -168,8 +202,6 @@ object PhotoProcessor {
             average(uSum, refU, n)
             average(vSum, refV, n)
         }
-
-        return toneMapToNv21(refY, refU, refV, w, h)
     }
 
     private fun toShorts(src: ByteArray): ShortArray {

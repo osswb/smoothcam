@@ -131,20 +131,27 @@ class MainActivity : Activity() {
     private var rawShot: RawShot? = null
     private lateinit var rawButton: Button
 
-    private class RawShot(val n: Int, val boost: Float, val zoom: Float, val orientation: Int) {
+    private class RawShot(val n: Int, val boost: Float, val zoom: Float, val orientation: Int, val aspect: Int) {
         val images = HashMap<Long, Image>()
         val results = HashMap<Long, TotalCaptureResult>()
     }
 
     // Ultrawide fill: the ultrawide lens shown, dimmed, around the photo frame (if the camera allows it)
-    private var uwPhysicalId: String? = null
-    private var uwFovRatio = 1f        // how much wider the ultrawide sees than the main lens
-    private var uwSize: Size? = null
-    private lateinit var bgSurfaceView: SurfaceView
+    // Edge fill: the area around the photo frame shows the best lens that covers it (ultrawide near
+    // 1x, the main lens' own full picture once zoomed in), dimmed, if the camera allows extra streams.
+    private var lenses: List<LensInfo> = emptyList()
+    private var uwLens: LensInfo? = null
+    private var mainLens: LensInfo? = null
+    private val bgViews = LinkedHashMap<String, SurfaceView>()                      // lens id -> view
+    private val bgReady = java.util.concurrent.ConcurrentHashMap<String, Boolean>()
+    @Volatile private var bgStreams: Set<String> = emptySet() // lenses the running session streams
+    @Volatile private var bgSource: String? = null            // the lens filling the edges right now
+    @Volatile private var bgTry = 0                            // which set of extra streams to try
     private lateinit var scrim: ScrimView
-    @Volatile private var bgSurfaceReady = false
-    @Volatile private var bgActive = false   // the running session streams the ultrawide
-    @Volatile private var bgAllowed = true   // cleared if the camera refuses the extra stream
+
+    // Photo aspect ratio: 0 = 4:3, 1 = 16:9, 2 = 1:1
+    @Volatile private var photoAspect = 0
+    private lateinit var aspectLabel: TextView
     private var zoomAnimator: android.animation.ValueAnimator? = null
 
     // Zoom / lenses
@@ -343,7 +350,7 @@ class MainActivity : Activity() {
         if (zoomRange.lower < 0.95f) zoomPresets += zoomRange.lower
         zoomPresets += 1f
         for (z in listOf(2f, 5f, 10f)) if (zoomRange.upper >= z) zoomPresets += z
-        findUltrawide()
+        findLenses()
         sensorOrientation = chars.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
 
         val map = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP) ?: return false
@@ -419,45 +426,25 @@ class MainActivity : Activity() {
         return true
     }
 
-    /**
-     * Look for an ultrawide lens that apps may stream alongside the main view (a "physical camera"
-     * behind the logical one). Only then can the area around the photo frame show the wider view.
-     */
-    private fun findUltrawide() {
+    /** Describe every lens behind the camera (field of view, optical centre) from its calibration. */
+    private fun findLenses() {
         try {
-            val physical = chars.physicalCameraIds
-            if (physical.isEmpty()) return
-            fun fov(c: CameraCharacteristics): Float? {
-                val f = c.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.minOrNull() ?: return null
-                val size = c.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE) ?: return null
-                return size.width / f
-            }
-            var bestId: String? = null
-            var bestFov = 0f
-            var bestChars: CameraCharacteristics? = null
-            for (pid in physical) {
-                val pc = cameraManager.getCameraCharacteristics(pid)
-                val f = fov(pc) ?: continue
-                if (f > bestFov) { bestFov = f; bestId = pid; bestChars = pc }
-            }
-            val pc = bestChars ?: return
-            // Zoom ratio 1.0 is the main lens by definition, so the zoom range's lower end tells us
-            // how much wider the ultrawide is; fall back to focal lengths if needed.
-            val ratio = if (zoomRange.lower < 0.95f) 1f / zoomRange.lower else {
-                val mainFov = physical.mapNotNull { fov(cameraManager.getCameraCharacteristics(it)) }
-                    .filter { it < bestFov }.maxOrNull() ?: return
-                bestFov / mainFov
-            }
-            if (ratio < 1.3f) return
-            val sizes = pc.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)?.getOutputSizes(SurfaceHolder::class.java)
-            val size = sizes?.filter { it.width * 3 == it.height * 4 && it.width <= 1440 }?.maxByOrNull { it.width } ?: return
-            uwPhysicalId = bestId
-            uwFovRatio = ratio
-            uwSize = size
-            Log.i(TAG, "ultrawide fill candidate: $bestId ratio=$ratio size=$size")
+            val (list, uw, main) = LensModel.build(cameraManager, chars, zoomRange.lower)
+            lenses = list
+            uwLens = uw
+            mainLens = main
         } catch (e: Exception) {
-            Log.w(TAG, "no ultrawide fill", e)
+            Log.w(TAG, "couldn't describe lenses", e)
         }
+    }
+
+    /** Lens sets to try streaming for the edge fill, best first; the camera may refuse extra streams. */
+    private fun bgCandidates(): List<List<String>> {
+        val ids = listOfNotNull(uwLens, mainLens).filter { bgViews.containsKey(it.id) }.map { it.id }.distinct()
+        val out = mutableListOf<List<String>>()
+        if (ids.size >= 2) out += ids
+        ids.forEach { out += listOf(it) }
+        return out
     }
 
     // ---------------------------------------------------------------- display refresh
@@ -585,8 +572,9 @@ class MainActivity : Activity() {
             return
         }
         closePhotoReader()
-        if (bgActive) {
-            bgActive = false
+        if (bgStreams.isNotEmpty()) {
+            bgStreams = emptySet()
+            bgSource = null
             mainHandler.post { positionBackground() }
         }
         val cam = device ?: return
@@ -775,7 +763,9 @@ class MainActivity : Activity() {
                 val b = photoRequestBuilder(cam)
                 b.addTarget(surfaceView.holder.surface)
                 photoReader?.let { b.addTarget(it.surface) }
-                if (bgActive && bgSurfaceReady) b.addTarget(bgSurfaceView.holder.surface)
+                bgSource?.let { id ->
+                    if (id in bgStreams && bgReady[id] == true) bgViews[id]?.let { v -> b.addTarget(v.holder.surface) }
+                }
                 s.setRepeatingRequest(b.build(), captureCallback, cameraHandler)
                 return
             }
@@ -960,15 +950,20 @@ class MainActivity : Activity() {
         // Portrait UI: the 16:9 sensor image is shown rotated, so the view is 9:16.
         val w = resources.displayMetrics.widthPixels
         val h = w * previewSize.width / previewSize.height
-        // Ultrawide view behind the main viewfinder (sized and placed by positionBackground()).
-        bgSurfaceView = SurfaceView(this)
-        root.addView(bgSurfaceView, FrameLayout.LayoutParams(1, 1, Gravity.TOP or Gravity.START))
-        uwSize?.let { bgSurfaceView.holder.setFixedSize(it.width, it.height) }
-        bgSurfaceView.holder.addCallback(object : SurfaceHolder.Callback {
-            override fun surfaceCreated(holder: SurfaceHolder) { bgSurfaceReady = true }
-            override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {}
-            override fun surfaceDestroyed(holder: SurfaceHolder) { bgSurfaceReady = false }
-        })
+        // Edge-fill views behind the main viewfinder, one per lens (sized and placed by positionBackground()).
+        for (lens in listOfNotNull(uwLens, mainLens).distinctBy { it.id }) {
+            val size = lens.bgSize ?: continue
+            val v = SurfaceView(this)
+            root.addView(v, FrameLayout.LayoutParams(1, 1, Gravity.TOP or Gravity.START))
+            v.holder.setFixedSize(size.width, size.height)
+            val id = lens.id
+            v.holder.addCallback(object : SurfaceHolder.Callback {
+                override fun surfaceCreated(holder: SurfaceHolder) { bgReady[id] = true }
+                override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {}
+                override fun surfaceDestroyed(holder: SurfaceHolder) { bgReady[id] = false }
+            })
+            bgViews[id] = v
+        }
 
         surfaceView = SurfaceView(this)
         surfaceView.setZOrderMediaOverlay(true) // main viewfinder above the ultrawide one
@@ -1172,6 +1167,11 @@ class MainActivity : Activity() {
             Gravity.TOP or Gravity.START
         ).apply { topMargin = dp(92); leftMargin = dp(16) })
 
+        aspectLabel = settingLabel().apply { setOnClickListener { showAspectMenu(it) } }
+        root.addView(aspectLabel, FrameLayout.LayoutParams(dp(50), dp(50),
+            Gravity.TOP or Gravity.END
+        ).apply { topMargin = dp(92); rightMargin = dp(16) })
+
         rawButton = pillButton().apply {
             text = "RAW+"
             setOnClickListener { cameraHandler.post { toggleRaw() } }
@@ -1236,7 +1236,7 @@ class MainActivity : Activity() {
         setContentView(root)
         // Only compact (square or round) controls turn with the phone; the PHOTO/VIDEO labels and the
         // slider stay put, as on iPhone.
-        rotatables += listOf(recText, hdrButton, maxResButton, rawButton, resLabel, fpsLabel, evChip, shutterChip, isoChip, thumbView)
+        rotatables += listOf(recText, hdrButton, maxResButton, rawButton, aspectLabel, resLabel, fpsLabel, evChip, shutterChip, isoChip, thumbView)
         rotatables += lensButtons
         styleRecordButton(false)
         updateButtons()
@@ -1315,6 +1315,8 @@ class MainActivity : Activity() {
         hdrButton.visibility = if (photoMode || !hdrSupported) View.GONE else View.VISIBLE
         maxResButton.visibility = if (photoMode && maxResSize != null) View.VISIBLE else View.GONE
         rawButton.visibility = if (photoMode && rawSize != null) View.VISIBLE else View.GONE
+        aspectLabel.visibility = if (photoMode) View.VISIBLE else View.GONE
+        aspectLabel.text = ASPECTS[photoAspect]
         stylePill(rawButton, rawOn)
         maxResSize?.let { maxResButton.text = String.format(Locale.US, "%.0f MP", it.width * it.height / 1_000_000.0) }
         stylePill(maxResButton, fiftyMpOn)
@@ -1381,6 +1383,32 @@ class MainActivity : Activity() {
         cameraHandler.post { restartVideo() }
     }
 
+    // ---------------------------------------------------------------- photo aspect ratio
+
+    private fun showAspectMenu(anchor: View) {
+        val pm = PopupMenu(this, anchor)
+        ASPECTS.forEachIndexed { i, label ->
+            pm.menu.add(0, i, i, label).apply {
+                isCheckable = true
+                isChecked = i == photoAspect
+            }
+        }
+        pm.setOnMenuItemClickListener { item ->
+            setAspect(item.itemId)
+            true
+        }
+        pm.show()
+    }
+
+    /** Main thread. Only the framing changes; the camera keeps running. */
+    private fun setAspect(a: Int) {
+        if (a == photoAspect) return
+        photoAspect = a
+        setPreviewLayout(photoPreviewSize)
+        positionBackground()
+        updateButtons()
+    }
+
     // ---------------------------------------------------------------- zoom
 
     /** Main thread. Jump to a zoom (pinch, dial). Cancels a running lens animation. */
@@ -1390,10 +1418,7 @@ class MainActivity : Activity() {
     }
 
     private fun applyZoomRatio(z: Float) {
-        val raw = photoMode && rawOn
-        val lo = if (raw) maxOf(1f, zoomRange.lower) else zoomRange.lower
-        val hi = if (raw) rawMaxZoom() else zoomRange.upper
-        zoomRatio = z.coerceIn(lo, maxOf(lo, hi))
+        zoomRatio = z.coerceIn(zoomRange.lower, zoomRange.upper)
         zoomDial.zoom = zoomRatio
         updateLensButtons()
         positionBackground()
@@ -1419,34 +1444,94 @@ class MainActivity : Activity() {
         }
     }
 
+    /** The part of the viewfinder that will be captured (photo aspect ratio applied). */
+    private fun captureRect(): android.graphics.Rect {
+        val l = surfaceView.left
+        val t = surfaceView.top
+        val r = surfaceView.right
+        val b = surfaceView.bottom
+        val cx = (l + r) / 2
+        val cy = (t + b) / 2
+        if (!photoMode) return android.graphics.Rect(l, t, r, b)
+        return when (photoAspect) {
+            1 -> { // 16:9 photo = 9:16 in portrait: crop the sides of the 3:4 viewfinder
+                val half = ((b - t) * 9 / 16) / 2
+                android.graphics.Rect(cx - half, t, cx + half, b)
+            }
+            2 -> { // 1:1
+                val half = (r - l) / 2
+                android.graphics.Rect(l, cy - half, r, cy + half)
+            }
+            else -> android.graphics.Rect(l, t, r, b)
+        }
+    }
+
     /**
-     * Main thread. Size the ultrawide view so its picture lines up with the main viewfinder: it is
-     * (ultrawide field of view / main field of view) x zoom times larger, centered on the frame.
+     * Main thread. Choose the lens that fills the edges and line its picture up with the viewfinder.
+     *
+     * The viewfinder shows the main lens zoomed by z, i.e. a field of view of main.tan / z. A lens
+     * can fill the screen around it if its field of view is at least that times how far the screen
+     * reaches beyond the viewfinder. Of the lenses that can, the narrowest (sharpest) one is used:
+     * the ultrawide near 1x, the main lens' own uncropped picture once zoomed in further.
+     * Each lens' picture is scaled by its field of view and shifted by its optical centre.
      */
     private fun positionBackground() {
-        if (!::bgSurfaceView.isInitialized) return
-        val lp = bgSurfaceView.layoutParams as FrameLayout.LayoutParams
-        val scale = uwFovRatio * zoomRatio
-        val show = photoMode && bgActive && scale in 1.02f..4f
+        if (!::scrim.isInitialized) return
+        val hole = captureRect()
+        scrim.setHole(hole.left, hole.top, hole.right, hole.bottom)
+
+        val main = mainLens
         val fw = surfaceView.width.toFloat()
         val fh = surfaceView.height.toFloat()
-        if (!show || fw <= 0f) {
-            if (lp.width != 1) {
-                lp.width = 1; lp.height = 1; lp.leftMargin = 0; lp.topMargin = 0
-                bgSurfaceView.layoutParams = lp
-            }
-        } else {
+        var chosen: LensInfo? = null
+        if (photoMode && main != null && fw > 0f && fh > 0f && bgStreams.isNotEmpty()) {
+            val z = zoomRatio
             val cx = surfaceView.left + fw / 2f
             val cy = surfaceView.top + fh / 2f
-            val bw = fw * scale
-            val bh = bw * 4f / 3f // portrait view of a 4:3 stream
-            lp.width = bw.toInt()
-            lp.height = bh.toInt()
-            lp.leftMargin = (cx - bw / 2f).toInt()
-            lp.topMargin = (cy - bh / 2f).toInt()
-            bgSurfaceView.layoutParams = lp
+            // How far the screen reaches beyond the viewfinder, in viewfinder half-sizes.
+            // Portrait: the viewfinder's height is the sensor's long side (X), its width the short side (Y).
+            val needX = maxOf(cy, rootView.height - cy) / (fh / 2f)
+            val needY = maxOf(cx, rootView.width - cx) / (fw / 2f)
+            val frameTanX = main.tanX / z
+            val frameTanY = main.tanY / z
+            val streamed = lenses.filter { it.id in bgStreams }.sortedBy { it.tanX }
+            chosen = streamed.firstOrNull { it.tanX / frameTanX >= needX && it.tanY / frameTanY >= needY }
+                ?: streamed.lastOrNull()?.takeIf { it.tanX / frameTanX > 1.03f } // best effort: widest
+            if (chosen != null) {
+                val sx = chosen.tanY / frameTanY // width scale
+                val sy = chosen.tanX / frameTanX // height scale
+                val bw = fw * sx
+                val bh = fh * sy
+                // Optical-centre alignment, converted from sensor axes to portrait screen axes.
+                val dBufX = (main.offX - chosen.offX) * (fh / 2f) / frameTanX
+                val dBufY = (main.offY - chosen.offY) * (fw / 2f) / frameTanY
+                val dxs = if (sensorOrientation == 270) dBufY else -dBufY
+                val dys = if (sensorOrientation == 270) -dBufX else dBufX
+                val v = bgViews[chosen.id]
+                if (v != null) {
+                    val lp = v.layoutParams as FrameLayout.LayoutParams
+                    lp.width = bw.toInt()
+                    lp.height = bh.toInt()
+                    lp.leftMargin = (cx - bw / 2f + dxs).toInt()
+                    lp.topMargin = (cy - bh / 2f + dys).toInt()
+                    v.layoutParams = lp
+                }
+            }
         }
-        scrim.setHole(surfaceView.left, surfaceView.top, surfaceView.right, surfaceView.bottom)
+        // Park the views that aren't in use.
+        for ((id, v) in bgViews) {
+            if (id == chosen?.id) continue
+            val lp = v.layoutParams as FrameLayout.LayoutParams
+            if (lp.width != 1) {
+                lp.width = 1; lp.height = 1; lp.leftMargin = 0; lp.topMargin = 0
+                v.layoutParams = lp
+            }
+        }
+        val newSource = chosen?.id
+        if (newSource != bgSource) {
+            bgSource = newSource
+            requestRepeatingUpdate() // stream only the lens in use
+        }
     }
 
     private fun zoomLabel(z: Float): String = when {
@@ -1630,11 +1715,12 @@ class MainActivity : Activity() {
         sb.append("ISO ${exposure.isoRange}, shutter ${ExposureControl.formatShutter(exposure.expRange.lower)}–${ExposureControl.formatShutter(exposure.expRange.upper)}\n")
         sb.append("Full-resolution photo mode: ${maxResSize ?: "not offered to apps"}\n")
         sb.append("RAW: ${rawSize ?: "not offered to apps"}\n")
-        sb.append("Ultrawide fill: " + when {
-            uwPhysicalId == null -> "no ultrawide lens offered to apps"
-            !bgAllowed -> "camera refused the extra stream"
-            bgActive -> "on (lens ${uwPhysicalId}, ${String.format(Locale.US, "%.2f", uwFovRatio)}× wider)"
-            else -> "available in photo mode"
+        sb.append("Lenses: ${if (lenses.isEmpty()) "none offered to apps" else lenses.joinToString("; ")}\n")
+        sb.append("Edge fill: " + when {
+            bgViews.isEmpty() -> "no extra lens streams offered to apps"
+            !photoMode -> "photo mode only"
+            bgStreams.isEmpty() -> "camera refused the extra streams"
+            else -> "streaming ${bgStreams.joinToString()}, showing ${bgSource ?: "none (frame already covers the screen)"}"
         } + "\n")
         if (!photoMode) {
             sb.append("\nAsked for: $wantedLabel\nRunning: ${modeName(modes[modeIndex], sessionHdr)}, ${stabName(sessionStab)}\n")
@@ -1745,6 +1831,7 @@ class MainActivity : Activity() {
                 val size = if (photo) photoPreviewSize else previewSize
                 if (surfaceSize == size) {
                     switching = false
+                    setPreviewLayout(size) // the framing may still differ (photo aspect ratio)
                     cameraHandler.post { startSession() }
                 } else {
                     awaitingSize = size
@@ -1755,10 +1842,14 @@ class MainActivity : Activity() {
     }
 
     private fun setPreviewLayout(size: Size) {
-        val w = resources.displayMetrics.widthPixels
+        // For 16:9 photos the viewfinder is widened so the 9:16 capture area spans the screen width
+        // (its sides run off-screen, like on iPhone).
+        val screenW = resources.displayMetrics.widthPixels
+        val w = if (photoMode && photoAspect == 1) screenW * 4 / 3 else screenW
         val lp = surfaceView.layoutParams as FrameLayout.LayoutParams
         lp.width = w
         lp.height = w * size.width / size.height
+        lp.gravity = Gravity.CENTER
         surfaceView.layoutParams = lp
         surfaceView.holder.setFixedSize(size.width, size.height)
     }
@@ -1825,17 +1916,15 @@ class MainActivity : Activity() {
             reader.setOnImageAvailableListener({ r -> onZslImage(r) }, cameraHandler)
             outputs = listOf(OutputConfiguration(surfaceView.holder.surface), OutputConfiguration(reader.surface))
         }
-        // Optional extra stream: the ultrawide lens for the area around the frame.
-        val uwId = uwPhysicalId
-        val useBg = !useMax && bgAllowed && bgSurfaceReady && uwId != null
-        val allOutputs = if (useBg && uwId != null) {
-            outputs + OutputConfiguration(bgSurfaceView.holder.surface).apply { setPhysicalCameraId(uwId) }
-        } else {
-            outputs
+        // Optional extra streams for the edge fill (one per lens); the camera may refuse them.
+        val bgIds = if (useMax) emptyList() else (bgCandidates().getOrNull(bgTry) ?: emptyList()).filter { bgReady[it] == true }
+        val useBg = bgIds.isNotEmpty()
+        val allOutputs = outputs + bgIds.map { id ->
+            OutputConfiguration(bgViews.getValue(id).holder.surface).apply { setPhysicalCameraId(id) }
         }
         fun dropBgAndRetry(why: String) {
-            logFailure("Ultrawide fill not available: $why")
-            bgAllowed = false
+            logFailure("Edge fill with lens ${bgIds.joinToString()} not available: $why")
+            bgTry++
             reader?.close()
             maxReader?.close()
             newRaw?.close()
@@ -1861,7 +1950,9 @@ class MainActivity : Activity() {
                         return
                     }
                     session = s
-                    bgActive = useBg
+                    bgStreams = bgIds.toSet()
+                    bgSource = null
+                    mainHandler.post { positionBackground() }
                     setRepeating(withRecord = false)
                     mainHandler.post {
                         positionBackground()
@@ -1874,7 +1965,7 @@ class MainActivity : Activity() {
 
                 override fun onConfigureFailed(s: CameraCaptureSession) {
                     if (useBg) {
-                        dropBgAndRetry("the camera rejected the extra ultrawide stream")
+                        dropBgAndRetry("the camera rejected the extra stream")
                     } else if (useRaw) {
                         logFailure("Camera rejected the RAW+ session")
                         rawOn = false
@@ -1895,7 +1986,7 @@ class MainActivity : Activity() {
             if (useBg) {
                 val supported = try { cam.isSessionConfigurationSupported(config) } catch (e: Exception) { true }
                 if (!supported) {
-                    dropBgAndRetry("the camera reports the extra ultrawide stream as unsupported")
+                    dropBgAndRetry("the camera reports the extra stream as unsupported")
                     return
                 }
             }
@@ -2042,7 +2133,7 @@ class MainActivity : Activity() {
             toast("RAW capture failed: ${ex.message}")
             return
         }
-        val shot = RawShot(n, 2.0.pow(under.toDouble()).toFloat(), zoomRatio, (sensorOrientation + deviceOrientation) % 360)
+        val shot = RawShot(n, 2.0.pow(under.toDouble()).toFloat(), zoomRatio, (sensorOrientation + deviceOrientation) % 360, photoAspect)
         rawShot = shot
         processingPhoto = true
         shotsInFlight.incrementAndGet()
@@ -2090,7 +2181,14 @@ class MainActivity : Activity() {
         if (keys.size < shot.n) return
         rawShot = null
         val images = keys.map { shot.images.getValue(it) }
-        val meta = RawProcessor.Meta.from(chars, shot.results.getValue(keys[0]), shot.boost, shot.zoom)
+        // RAW frames come uncropped from whichever lens took them: crop by the zoom relative to that
+        // lens, and develop with that lens' own colour filter layout and levels.
+        val result = shot.results.getValue(keys[0])
+        val activeId = result.get(CaptureResult.LOGICAL_MULTI_CAMERA_ACTIVE_PHYSICAL_ID)
+        val lens = lenses.firstOrNull { it.id == activeId } ?: mainLens
+        val crop = shot.zoom / (lens?.base ?: 1f)
+        Log.i(TAG, "RAW+ from lens ${activeId ?: "?"} (base ${lens?.base}), crop $crop")
+        val meta = RawProcessor.Meta.from(lens?.chars ?: chars, result, shot.boost, crop, shot.aspect)
         copyExecutor.execute {
             val frames = try {
                 images.map<Image, RawProcessor.RawFrame?> { RawProcessor.RawFrame.copyOf(it) }.toMutableList()
@@ -2146,16 +2244,11 @@ class MainActivity : Activity() {
         rawOn = !rawOn
         if (rawOn) fiftyMpOn = false
         mainHandler.post {
-            applyZoomRatio(zoomRatio) // RAW+ works with the main lens: keep zoom within it
             updateButtons()
             updateStatus()
-            if (rawOn) toast("RAW+: merged RAW burst, main lens (1×–${zoomLabel(rawMaxZoom())})")
         }
         startSession()
     }
-
-    /** RAW frames come uncropped from whichever lens is active, so RAW+ stays on the main lens. */
-    private fun rawMaxZoom(): Float = zoomPresets.firstOrNull { it >= 4.99f }?.let { it - 0.1f } ?: zoomRange.upper
 
     /** Camera thread. One full-resolution still; the preview pauses briefly while the sensor switches mode. */
     private fun takeMaxResPhoto() {
@@ -2219,7 +2312,7 @@ class MainActivity : Activity() {
      * Copies the frames out of the camera's buffers (and returns the buffers), shows a quick
      * thumbnail, then queues the real processing. Takes ownership of the Images.
      */
-    private fun processFrames(frames: List<Image>, iso: Int, orientation: Int) {
+    private fun processFrames(frames: List<Image>, iso: Int, orientation: Int, aspect: Int = photoAspect) {
         val t0 = SystemClock.elapsedRealtime()
         copyExecutor.execute {
             val copies = try {
@@ -2248,7 +2341,7 @@ class MainActivity : Activity() {
             }
             photoExecutor.execute {
                 val uri = try {
-                    PhotoProcessor.processAndSave(this, copies, iso, orientation)
+                    PhotoProcessor.processAndSave(this, copies, iso, orientation, aspect)
                 } catch (e: Throwable) {
                     Log.e(TAG, "photo processing failed", e)
                     null
@@ -2378,6 +2471,7 @@ class MainActivity : Activity() {
         private const val ZSL_MAX_IMAGES = 9  // camera buffers for the full-res stream
         private const val ZSL_RING = 4        // frames kept for the next shot
         private const val PHOTO_BURST = 4     // frames merged per photo
+        private val ASPECTS = arrayOf("4:3", "16:9", "1:1")
         private const val RAW_BURST_MAX = 8   // RAW frames in dark scenes (6 otherwise)
         private const val MAX_QUEUED_SHOTS = 3 // photos waiting to be saved (each holds ~75 MB)
     }
