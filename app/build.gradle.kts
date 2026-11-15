@@ -16,7 +16,7 @@ android {
         // Version = "<baseVersion>.<build number>", e.g. 0.5.7. Raise baseVersion by hand for a new
         // version; the build number comes from the cloud build, so every build is a newer version.
         // The release tag uses the same string (v0.5.7), which is what update checkers like Obtainium compare.
-        val baseVersion = "0.6"
+        val baseVersion = "0.7"
         val buildNumber = System.getenv("GITHUB_RUN_NUMBER")?.toIntOrNull() ?: 0
         versionCode = maxOf(buildNumber, 1)
         versionName = "$baseVersion.$buildNumber"
