@@ -27,16 +27,6 @@ Photos are about 12 MP and saved to `Pictures/SmoothCam`.
 
 **Full resolution (50 MP):** if the camera lets apps use its full-resolution sensor mode, a **50 MP** button (showing the actual megapixels) appears at the top left in photo mode. Many phone makers keep this mode for their own camera app, so **if the button doesn't appear, your Pixel doesn't offer it to other apps**. In 50 MP mode each photo is a single frame (no zero-lag buffer or multi-frame merge), the viewfinder pauses briefly when you shoot, and processing takes a few seconds. It's best in good light; in dim light the 12 MP merged photos will look cleaner. Processing takes about a second; the next shot is available once "Processing…" disappears. All look settings are constants at the top of `PhotoProcessor.kt` if you want to tune them.
 
-## Get the APK (no computer tools needed)
-
-1. Create a new **empty** repository on github.com.
-2. Upload this project to it (all files, keeping the folder structure, including the hidden `.github` folder).
-3. GitHub Actions builds the app automatically (about 4–6 minutes). Watch it under the repo's **Actions** tab.
-4. On your Pixel, open the repo's **Releases** page, tap **SmoothCam.apk**, and open it.
-5. Android will ask you to allow installs from your browser. Allow it, then tap **Install**.
-
-Alternatively, open the folder in Android Studio and press Run.
-
 ## Using it
 
 - **PHOTO / VIDEO** (above the shutter): switch modes.
