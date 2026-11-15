@@ -22,7 +22,26 @@ android {
         versionName = "$baseVersion.$buildNumber"
     }
 
+    // Permanent signing key, provided by the cloud build from repository secrets
+    // (SIGNING_KEYSTORE_BASE64 / SIGNING_PASSWORD). Android only installs an update when it is
+    // signed with the same key as the installed app; without the secrets each build would get a
+    // throwaway key and could not update the app.
+    val keystorePath = System.getenv("SIGNING_KEYSTORE_FILE")
+    signingConfigs {
+        if (keystorePath != null) {
+            create("stable") {
+                storeFile = file(keystorePath)
+                storePassword = System.getenv("SIGNING_PASSWORD")
+                keyAlias = "smoothcam"
+                keyPassword = System.getenv("SIGNING_PASSWORD")
+            }
+        }
+    }
+
     buildTypes {
+        debug {
+            if (keystorePath != null) signingConfig = signingConfigs.getByName("stable")
+        }
         release {
             isMinifyEnabled = false
         }

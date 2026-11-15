@@ -27,7 +27,21 @@ jobs:
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
           echo "Building SmoothCam $VERSION (build $GITHUB_RUN_NUMBER)"
 
+      - name: Set up signing key
+        env:
+          KEYSTORE_B64: ${{ secrets.SIGNING_KEYSTORE_BASE64 }}
+        run: |
+          if [ -n "$KEYSTORE_B64" ]; then
+            echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/smoothcam.jks"
+            echo "SIGNING_KEYSTORE_FILE=$RUNNER_TEMP/smoothcam.jks" >> "$GITHUB_ENV"
+            echo "Signing with the permanent SmoothCam key."
+          else
+            echo "::warning::SIGNING_KEYSTORE_BASE64 secret is missing: this APK uses a throwaway key and cannot update an installed SmoothCam."
+          fi
+
       - name: Build debug APK
+        env:
+          SIGNING_PASSWORD: ${{ secrets.SIGNING_PASSWORD }}
         run: |
           chmod +x gradlew
           ./gradlew assembleDebug --stacktrace
