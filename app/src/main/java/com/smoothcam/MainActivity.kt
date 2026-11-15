@@ -147,6 +147,9 @@ class MainActivity : Activity() {
     @Volatile private var bgStreams: Set<String> = emptySet() // lenses the running session streams
     @Volatile private var bgSource: String? = null            // the lens filling the edges right now
     @Volatile private var bgTry = 0                            // which set of extra streams to try
+    // Measured crop of each edge-fill stream, read back from the camera's per-lens results:
+    // [visible fraction along sensor X, along Y, crop-centre offset X, Y (tan units)].
+    private val bgCrop = java.util.concurrent.ConcurrentHashMap<String, FloatArray>()
     private lateinit var scrim: ScrimView
 
     // Photo aspect ratio: 0 = 4:3, 1 = 16:9, 2 = 1:1
@@ -760,12 +763,11 @@ class MainActivity : Activity() {
         val s = session ?: return
         try {
             if (photoMode) {
-                val b = photoRequestBuilder(cam)
+                val src = bgSource?.takeIf { it in bgStreams && bgReady[it] == true && bgViews.containsKey(it) }
+                val b = photoRequestBuilder(cam, setOfNotNull(src))
                 b.addTarget(surfaceView.holder.surface)
                 photoReader?.let { b.addTarget(it.surface) }
-                bgSource?.let { id ->
-                    if (id in bgStreams && bgReady[id] == true) bgViews[id]?.let { v -> b.addTarget(v.holder.surface) }
-                }
+                src?.let { id -> b.addTarget(bgViews.getValue(id).holder.surface) }
                 s.setRepeatingRequest(b.build(), captureCallback, cameraHandler)
                 return
             }
@@ -789,6 +791,7 @@ class MainActivity : Activity() {
                 exposure.lastAutoIso = lastIso
                 exposure.lastAutoBoost = lastBoost
             }
+            bgSource?.let { id -> measureBgCrop(id, result.physicalCameraTotalResults[id]) }
 
             val ts = result.get(CaptureResult.SENSOR_TIMESTAMP) ?: return
             if (lastTs != 0L) {
@@ -1444,6 +1447,32 @@ class MainActivity : Activity() {
         }
     }
 
+    /**
+     * Camera thread. Read back what part of its sensor an edge-fill lens actually streamed (the
+     * camera may crop it, e.g. by applying the zoom to it too) and re-align if that changed.
+     */
+    private fun measureBgCrop(id: String, pr: CaptureResult?) {
+        if (pr == null) return
+        val lens = lenses.firstOrNull { it.id == id } ?: return
+        val active = lens.chars.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE) ?: return
+        val crop = pr.get(CaptureResult.SCALER_CROP_REGION) ?: return
+        val zr = pr.get(CaptureResult.CONTROL_ZOOM_RATIO) ?: 1f
+        if (active.width() <= 0 || active.height() <= 0 || zr <= 0f) return
+        val fx = crop.width().toFloat() / active.width() / zr
+        val fy = crop.height().toFloat() / active.height() / zr
+        // Crop-region coordinates start at the active array's top-left corner.
+        val ox = (crop.exactCenterX() - active.width() / 2f) / (active.width() / 2f) * lens.tanX
+        val oy = (crop.exactCenterY() - active.height() / 2f) / (active.height() / 2f) * lens.tanY
+        val old = bgCrop[id]
+        if (old == null || abs(old[0] - fx) > 0.01f || abs(old[1] - fy) > 0.01f ||
+            abs(old[2] - ox) > 0.002f || abs(old[3] - oy) > 0.002f
+        ) {
+            bgCrop[id] = floatArrayOf(fx, fy, ox, oy)
+            Log.i(TAG, String.format(Locale.US, "edge fill %s: camera streams %.0f%% x %.0f%% of the lens", id, fx * 100, fy * 100))
+            mainHandler.post { positionBackground() }
+        }
+    }
+
     /** The part of the viewfinder that will be captured (photo aspect ratio applied). */
     private fun captureRect(): android.graphics.Rect {
         val l = surfaceView.left
@@ -1494,17 +1523,22 @@ class MainActivity : Activity() {
             val needY = maxOf(cx, rootView.width - cx) / (fw / 2f)
             val frameTanX = main.tanX / z
             val frameTanY = main.tanY / z
-            val streamed = lenses.filter { it.id in bgStreams }.sortedBy { it.tanX }
-            chosen = streamed.firstOrNull { it.tanX / frameTanX >= needX && it.tanY / frameTanY >= needY }
-                ?: streamed.lastOrNull()?.takeIf { it.tanX / frameTanX > 1.03f } // best effort: widest
+            // What each lens' stream really shows: its field of view, reduced by any crop the camera applies.
+            fun tX(l: LensInfo) = l.tanX * (bgCrop[l.id]?.get(0) ?: 1f)
+            fun tY(l: LensInfo) = l.tanY * (bgCrop[l.id]?.get(1) ?: 1f)
+            fun oX(l: LensInfo) = l.offX - (bgCrop[l.id]?.get(2) ?: 0f)
+            fun oY(l: LensInfo) = l.offY - (bgCrop[l.id]?.get(3) ?: 0f)
+            val streamed = lenses.filter { it.id in bgStreams }.sortedBy { tX(it) }
+            chosen = streamed.firstOrNull { tX(it) / frameTanX >= needX && tY(it) / frameTanY >= needY }
+                ?: streamed.lastOrNull()?.takeIf { tX(it) / frameTanX > 1.03f } // best effort: widest
             if (chosen != null) {
-                val sx = chosen.tanY / frameTanY // width scale
-                val sy = chosen.tanX / frameTanX // height scale
+                val sx = tY(chosen) / frameTanY // width scale
+                val sy = tX(chosen) / frameTanX // height scale
                 val bw = fw * sx
                 val bh = fh * sy
                 // Optical-centre alignment, converted from sensor axes to portrait screen axes.
-                val dBufX = (main.offX - chosen.offX) * (fh / 2f) / frameTanX
-                val dBufY = (main.offY - chosen.offY) * (fw / 2f) / frameTanY
+                val dBufX = (main.offX - oX(chosen)) * (fh / 2f) / frameTanX
+                val dBufY = (main.offY - oY(chosen)) * (fw / 2f) / frameTanY
                 val dxs = if (sensorOrientation == 270) dBufY else -dBufY
                 val dys = if (sensorOrientation == 270) -dBufX else dBufX
                 val v = bgViews[chosen.id]
@@ -1720,7 +1754,10 @@ class MainActivity : Activity() {
             bgViews.isEmpty() -> "no extra lens streams offered to apps"
             !photoMode -> "photo mode only"
             bgStreams.isEmpty() -> "camera refused the extra streams"
-            else -> "streaming ${bgStreams.joinToString()}, showing ${bgSource ?: "none (frame already covers the screen)"}"
+            else -> "streaming ${bgStreams.joinToString()}, showing ${bgSource ?: "none (frame already covers the screen)"}" +
+                bgCrop.entries.joinToString("") { (id, c) ->
+                    String.format(Locale.US, "; lens %s streams %.0f%% of its view", id, c[0] * 100)
+                }
         } + "\n")
         if (!photoMode) {
             sb.append("\nAsked for: $wantedLabel\nRunning: ${modeName(modes[modeIndex], sessionHdr)}, ${stabName(sessionStab)}\n")
@@ -1854,12 +1891,29 @@ class MainActivity : Activity() {
         surfaceView.holder.setFixedSize(size.width, size.height)
     }
 
-    private fun photoRequestBuilder(cam: CameraDevice): CaptureRequest.Builder {
+    private fun photoRequestBuilder(cam: CameraDevice, physicalIds: Set<String> = emptySet()): CaptureRequest.Builder {
         // The ZSL template keeps every streamed frame at still-photo quality.
         val b = try {
-            cam.createCaptureRequest(CameraDevice.TEMPLATE_ZERO_SHUTTER_LAG)
+            if (physicalIds.isEmpty()) cam.createCaptureRequest(CameraDevice.TEMPLATE_ZERO_SHUTTER_LAG)
+            else cam.createCaptureRequest(CameraDevice.TEMPLATE_ZERO_SHUTTER_LAG, physicalIds)
         } catch (e: Exception) {
-            cam.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
+            if (physicalIds.isEmpty()) cam.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
+            else cam.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW, physicalIds)
+        }
+        // The zoom is for the main viewfinder only: ask for the edge-fill lenses' full, uncropped view.
+        val physKeys = try { chars.availablePhysicalCameraRequestKeys } catch (e: Exception) { null } ?: emptyList()
+        for (id in physicalIds) {
+            try {
+                if (physKeys.contains(CaptureRequest.CONTROL_ZOOM_RATIO)) {
+                    b.setPhysicalCameraKey(CaptureRequest.CONTROL_ZOOM_RATIO, 1f, id)
+                }
+                val active = lenses.firstOrNull { it.id == id }?.chars?.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
+                if (active != null && physKeys.contains(CaptureRequest.SCALER_CROP_REGION)) {
+                    b.setPhysicalCameraKey(CaptureRequest.SCALER_CROP_REGION, android.graphics.Rect(0, 0, active.width(), active.height()), id)
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "per-lens settings not accepted for $id", e)
+            }
         }
         b.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
         b.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
