@@ -23,6 +23,7 @@ import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.CaptureResult
 import android.hardware.camera2.TotalCaptureResult
 import android.hardware.camera2.params.DynamicRangeProfiles
+import android.hardware.camera2.params.MeteringRectangle
 import android.hardware.camera2.params.OutputConfiguration
 import android.hardware.camera2.params.SessionConfiguration
 import android.media.Image
@@ -43,6 +44,7 @@ import android.util.Log
 import android.util.Range
 import android.util.Size
 import android.view.Gravity
+import android.view.GestureDetector
 import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.ScaleGestureDetector
@@ -58,7 +60,6 @@ import android.widget.ImageView
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.PopupMenu
-import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
 import java.io.File
@@ -254,8 +255,19 @@ class MainActivity : Activity() {
     private lateinit var isoChip: TextView
     private lateinit var sliderPanel: LinearLayout
     private lateinit var sliderLabel: TextView
-    private lateinit var slider: SeekBar
-    private var activeControl: String? = null      // "ev", "s" or "iso" while its slider is open
+    private lateinit var slider: ControlSlider
+    private var activeControl: String? = null      // "ev", "s", "iso" or "focus" while its slider is open
+    private lateinit var focusChip: TextView
+    private lateinit var controlsHandle: TextView
+    private var controlsShown = false
+
+    // Focus (tap-to-focus and a manual-focus control)
+    private var minFocusDist = 0f                  // dioptres; 0 = fixed-focus lens
+    @Volatile private var focusManual = false
+    @Volatile private var focusDiopter = 0f        // 0 = infinity
+    @Volatile private var afRegion: MeteringRectangle? = null // tapped focus point, null = continuous
+    @Volatile private var afTapPending = false     // send one AF trigger on the next request
+    private lateinit var focusReticle: FocusReticleView
     private val rotatables = mutableListOf<View>()  // controls that turn with the phone
     private var uiRotation = 0f
     private lateinit var hdrButton: Button
@@ -365,6 +377,7 @@ class MainActivity : Activity() {
         for (z in listOf(2f, 5f, 10f)) if (zoomRange.upper >= z) zoomPresets += z
         findLenses()
         sensorOrientation = chars.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
+        minFocusDist = chars.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE) ?: 0f
 
         val map = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP) ?: return false
         val fpsRanges = chars.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES) ?: emptyArray()
@@ -740,12 +753,38 @@ class MainActivity : Activity() {
 
     private fun applyControls(b: CaptureRequest.Builder, mode: VideoMode, stab: Int = sessionStab) {
         b.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
-        b.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
+        applyFocus(b, video = true)
         b.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, mode.fpsRange)
         b.set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, stab)
         applyOis(b)
         applyZoom(b)
         exposure.apply(b, mode.fps, 1_000_000_000L / mode.fps, video = true)
+    }
+
+    /**
+     * Sets focus for a request: a manually chosen distance, a tapped point (one-shot auto that then
+     * holds), or continuous autofocus. [tapTrigger] sends a single AF trigger to lock the tap point.
+     */
+    private fun applyFocus(b: CaptureRequest.Builder, video: Boolean, tapTrigger: Boolean = false) {
+        when {
+            focusManual && minFocusDist > 0f -> {
+                b.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_OFF)
+                b.set(CaptureRequest.LENS_FOCUS_DISTANCE, focusDiopter.coerceIn(0f, minFocusDist))
+            }
+            afRegion != null -> {
+                b.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_AUTO)
+                b.set(CaptureRequest.CONTROL_AF_REGIONS, arrayOf(afRegion))
+                if (exposure.isFullyAuto || exposure.evActive) {
+                    b.set(CaptureRequest.CONTROL_AE_REGIONS, arrayOf(afRegion))
+                }
+                if (tapTrigger) b.set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_START)
+            }
+            else -> {
+                b.set(CaptureRequest.CONTROL_AF_MODE,
+                    if (video) CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_VIDEO
+                    else CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+            }
+        }
     }
 
     private fun applyOis(b: CaptureRequest.Builder) {
@@ -990,6 +1029,8 @@ class MainActivity : Activity() {
         // Dims everything outside the frame that will be captured.
         scrim = ScrimView(this)
         root.addView(scrim, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        focusReticle = FocusReticleView(this)
+        root.addView(focusReticle, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
         surfaceView.holder.setFixedSize(previewSize.width, previewSize.height)
         // Pinch to zoom; the camera switches lenses by itself as the zoom ratio crosses them.
         val scaleDetector = ScaleGestureDetector(this, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
@@ -999,8 +1040,27 @@ class MainActivity : Activity() {
                 return true
             }
         })
+        var swipeHandled = false
+        val gestures = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
+            override fun onSingleTapConfirmed(e: MotionEvent): Boolean {
+                tapToFocus(e.rawX, e.rawY)
+                return true
+            }
+            override fun onScroll(e1: MotionEvent?, e2: MotionEvent, dx: Float, dy: Float): Boolean {
+                if (swipeHandled || scaleDetector.isInProgress) return false
+                val totY = e2.y - (e1?.y ?: e2.y)
+                val totX = e2.x - (e1?.x ?: e2.x)
+                if (abs(totY) > abs(totX) && abs(totY) > dp(40)) {
+                    if (totY < 0) showControls() else hideControls()
+                    swipeHandled = true
+                }
+                return true
+            }
+        })
         surfaceView.setOnTouchListener { v, e ->
+            if (e.actionMasked == MotionEvent.ACTION_DOWN) swipeHandled = false
             scaleDetector.onTouchEvent(e)
+            if (!scaleDetector.isInProgress) gestures.onTouchEvent(e)
             if (e.actionMasked == MotionEvent.ACTION_UP) v.performClick()
             true
         }
@@ -1128,15 +1188,33 @@ class MainActivity : Activity() {
         evChip = chip("ev")
         shutterChip = chip("s")
         isoChip = chip("iso")
-        for (c in listOf(evChip, shutterChip, isoChip)) {
-            chipRow.addView(c, LinearLayout.LayoutParams(dp(60), dp(60)).apply {
-                leftMargin = dp(6); rightMargin = dp(6)
+        focusChip = chip("focus")
+        for (c in listOf(evChip, shutterChip, isoChip, focusChip)) {
+            chipRow.addView(c, LinearLayout.LayoutParams(dp(58), dp(58)).apply {
+                leftMargin = dp(5); rightMargin = dp(5)
             })
         }
+        chipRow.visibility = View.GONE
         root.addView(chipRow, FrameLayout.LayoutParams(
             ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
             Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
         ).apply { bottomMargin = dp(246) })
+
+        // Handle hint: tells the user controls are a swipe-up away; also tap to toggle.
+        controlsHandle = TextView(this).apply {
+            text = "⌃"
+            textSize = 16f
+            gravity = Gravity.CENTER
+            setTextColor(Color.argb(200, 255, 255, 255))
+            background = GradientDrawable().apply {
+                setColor(Color.argb(120, 0, 0, 0))
+                cornerRadius = dp(14).toFloat()
+            }
+            setOnClickListener { if (controlsShown) hideControls() else showControls() }
+        }
+        root.addView(controlsHandle, FrameLayout.LayoutParams(dp(54), dp(26),
+            Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
+        ).apply { bottomMargin = dp(252) })
 
         sliderPanel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -1152,17 +1230,11 @@ class MainActivity : Activity() {
             setTextColor(Color.WHITE)
             textSize = 14f
         }
-        slider = SeekBar(this).apply {
-            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-                override fun onProgressChanged(bar: SeekBar, progress: Int, fromUser: Boolean) {
-                    if (fromUser) applySlider(progress)
-                }
-                override fun onStartTrackingTouch(bar: SeekBar) {}
-                override fun onStopTrackingTouch(bar: SeekBar) {}
-            })
+        slider = ControlSlider(this).apply {
+            onIndexChanged = { i -> applySlider(i) }
         }
+        sliderPanel.addView(slider, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(76)))
         sliderPanel.addView(sliderLabel, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
-        sliderPanel.addView(slider, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(36)))
         root.addView(sliderPanel, FrameLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
             Gravity.BOTTOM
@@ -1227,14 +1299,8 @@ class MainActivity : Activity() {
             zoom = zoomRatio
             visibility = View.GONE
             onZoomChanged = { z -> setZoom(z) }
-            onShown = {
-                lensRow.animate().alpha(0f).setDuration(120).start()
-                chipRow.animate().alpha(0f).setDuration(120).start()
-            }
-            onHidden = {
-                lensRow.animate().alpha(1f).setDuration(150).start()
-                chipRow.animate().alpha(1f).setDuration(150).start()
-            }
+            onShown = { lensRow.animate().alpha(0f).setDuration(120).start() }
+            onHidden = { lensRow.animate().alpha(1f).setDuration(150).start() }
         }
         root.addView(zoomDial, FrameLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, dp(118), Gravity.BOTTOM
@@ -1261,7 +1327,7 @@ class MainActivity : Activity() {
         setContentView(root)
         // Only compact (square or round) controls turn with the phone; the PHOTO/VIDEO labels and the
         // slider stay put, as on iPhone.
-        rotatables += listOf(recText, hdrButton, maxResButton, rawButton, edgeButton, aspectLabel, resLabel, fpsLabel, evChip, shutterChip, isoChip, thumbView)
+        rotatables += listOf(recText, hdrButton, maxResButton, rawButton, edgeButton, aspectLabel, resLabel, fpsLabel, evChip, shutterChip, isoChip, focusChip, controlsHandle, thumbView)
         rotatables += lensButtons
         styleRecordButton(false)
         updateButtons()
@@ -1584,6 +1650,44 @@ class MainActivity : Activity() {
     private fun isoOpts() = exposure.isoOptions()
     private fun evOpts() = exposure.evOptions()
 
+    /** Dioptre values for the manual-focus control: Auto, then infinity to the closest focus. */
+    private fun focusDiopters(): List<Float> {
+        if (minFocusDist <= 0f) return listOf(0f)
+        val steps = 24
+        return (0..steps).map { it.toFloat() / steps * minFocusDist }
+    }
+
+    /** The labels shown on the slider for a control, and the index currently selected. */
+    private fun controlOptions(which: String): Pair<List<String>, Int> = when (which) {
+        "ev" -> evOpts().map { exposure.evLabel(it) } to evOpts().indexOf(exposure.evIndex).coerceAtLeast(0)
+        "s" -> {
+            val opts = shutterOpts()
+            opts.map { exposure.shutterLabel(it, currentFps()).substringBefore(" (") } to opts.indexOf(exposure.shutter).coerceAtLeast(0)
+        }
+        "iso" -> isoOpts().map { it?.toString() ?: "Auto" } to isoOpts().indexOf(exposure.iso).coerceAtLeast(0)
+        else -> {
+            val d = focusDiopters()
+            val labels = d.mapIndexed { i, v -> if (i == 0 && !focusManual) "Auto" else focusLabel(v) }
+            val idx = if (!focusManual) 0 else d.indexOfFirst { abs(it - focusDiopter) < 1e-3f }.coerceAtLeast(0)
+            labels to idx
+        }
+    }
+
+    private fun focusLabel(diopter: Float): String = when {
+        diopter <= 0.001f -> "∞"
+        else -> {
+            val m = 1f / diopter
+            if (m >= 1f) String.format(Locale.US, "%.1fm", m) else String.format(Locale.US, "%.0fcm", m * 100)
+        }
+    }
+
+    private fun controlTitle(which: String): String = when (which) {
+        "ev" -> "Exposure compensation"
+        "s" -> "Shutter speed"
+        "iso" -> "ISO"
+        else -> "Focus"
+    }
+
     private fun toggleControl(which: String) {
         if (activeControl == which) {
             activeControl = null
@@ -1591,18 +1695,13 @@ class MainActivity : Activity() {
             updateChips()
             return
         }
-        val (count, index) = when (which) {
-            "ev" -> evOpts().size to evOpts().indexOf(exposure.evIndex)
-            "s" -> shutterOpts().size to shutterOpts().indexOf(exposure.shutter)
-            else -> isoOpts().size to isoOpts().indexOf(exposure.iso)
-        }
-        if (count < 2) {
+        val (labels, index) = controlOptions(which)
+        if (labels.size < 2) {
             toast("This camera doesn't allow changing that")
             return
         }
         activeControl = which
-        slider.max = count - 1
-        slider.progress = index.coerceAtLeast(0)
+        slider.setOptions(controlTitle(which), labels, index)
         sliderPanel.visibility = View.VISIBLE
         updateChips()
     }
@@ -1618,6 +1717,15 @@ class MainActivity : Activity() {
                 exposure.freezeIfLeavingAuto()
                 exposure.iso = isoOpts()[i]
             }
+            "focus" -> {
+                if (i == 0) {
+                    focusManual = false
+                } else {
+                    focusManual = true
+                    afRegion = null // manual focus overrides a tapped point
+                    focusDiopter = focusDiopters().getOrElse(i) { 0f }
+                }
+            }
         }
         updateChips()
         requestRepeatingUpdate()
@@ -1627,18 +1735,124 @@ class MainActivity : Activity() {
         when (which) {
             "ev" -> exposure.evIndex = 0
             "s" -> exposure.shutter = ExposureControl.Shutter.Auto
-            else -> exposure.iso = null
+            "iso" -> exposure.iso = null
+            "focus" -> { focusManual = false; afRegion = null }
         }
         if (activeControl == which) {
-            val idx = when (which) {
-                "ev" -> evOpts().indexOf(0)
-                else -> 0
-            }
-            slider.progress = idx.coerceAtLeast(0)
+            val (labels, index) = controlOptions(which)
+            slider.setOptions(controlTitle(which), labels, index)
         }
         updateChips()
         requestRepeatingUpdate()
-        toast("${which.uppercase(Locale.US)} reset to auto")
+        toast("${controlTitle(which)} reset to auto")
+    }
+
+    // ---- show / hide the control chips (slide-up gesture or the handle)
+
+    private fun showControls() {
+        if (controlsShown) return
+        controlsShown = true
+        chipRow.alpha = 0f
+        chipRow.visibility = View.VISIBLE
+        chipRow.translationY = dp(20).toFloat()
+        chipRow.animate().alpha(1f).translationY(0f).setDuration(160).start()
+        controlsHandle.text = "⌄"
+    }
+
+    private fun hideControls() {
+        if (!controlsShown) return
+        controlsShown = false
+        activeControl = null
+        sliderPanel.visibility = View.GONE
+        chipRow.animate().alpha(0f).translationY(dp(20).toFloat()).setDuration(150).withEndAction {
+            if (!controlsShown) chipRow.visibility = View.GONE
+        }.start()
+        controlsHandle.text = "⌃"
+        updateChips()
+    }
+
+    // ---- tap to focus
+
+    /** Screen coordinates of a tap on the viewfinder -> metering point; triggers a focus there. */
+    private fun tapToFocus(rawX: Float, rawY: Float) {
+        val region = meteringRegionFor(rawX, rawY) ?: return
+        afRegion = region
+        focusManual = false
+        afTapPending = true
+        val loc = IntArray(2)
+        rootView.getLocationOnScreen(loc)
+        mainHandler.post {
+            focusReticle.showAt(rawX - loc[0], rawY - loc[1])
+            if (activeControl == "focus") {
+                val (labels, index) = controlOptions("focus")
+                slider.setOptions(controlTitle("focus"), labels, index)
+            }
+            updateChips()
+        }
+        cameraHandler.post { triggerAf() }
+    }
+
+    /** Camera thread. Fire one AF trigger at the tapped region, then resume the repeating request. */
+    private fun triggerAf() {
+        val cam = device ?: return
+        val s = session ?: return
+        try {
+            val b: CaptureRequest.Builder
+            if (photoMode) {
+                b = photoRequestBuilder(cam)
+                b.addTarget(surfaceView.holder.surface)
+                photoReader?.let { b.addTarget(it.surface) }
+                applyFocus(b, video = false, tapTrigger = true)
+            } else {
+                b = cam.createCaptureRequest(CameraDevice.TEMPLATE_RECORD)
+                b.addTarget(surfaceView.holder.surface)
+                if (recording) recordSurface?.let { b.addTarget(it) }
+                applyControls(b, modes[modeIndex])
+                applyFocus(b, video = true, tapTrigger = true)
+            }
+            s.capture(b.build(), null, cameraHandler)
+            afTapPending = false
+            setRepeating(recording) // continues with AF_MODE_AUTO holding the tapped point
+        } catch (e: Exception) {
+            Log.w(TAG, "AF trigger failed", e)
+        }
+    }
+
+    /**
+     * Builds a metering rectangle (in the logical sensor's active-array coordinates) for a tap.
+     * Maps the tap within the capture frame to sensor coordinates, through the rotation and the
+     * current magnification (the visible field is the active array cropped by the total zoom).
+     */
+    private fun meteringRegionFor(rawX: Float, rawY: Float): MeteringRectangle? {
+        val active = chars.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE) ?: return null
+        val loc = IntArray(2)
+        rootView.getLocationOnScreen(loc)
+        val hole = captureRect()
+        var u = (rawX - loc[0] - hole.left) / hole.width()
+        var v = (rawY - loc[1] - hole.top) / hole.height()
+        if (u < 0f || u > 1f || v < 0f || v > 1f) return null
+        // Portrait view (u right, v down) -> sensor-native axes (sx right, sy down).
+        val sx: Float
+        val sy: Float
+        when (sensorOrientation) {
+            90 -> { sx = v; sy = 1f - u }
+            270 -> { sx = 1f - v; sy = u }
+            180 -> { sx = 1f - u; sy = 1f - v }
+            else -> { sx = u; sy = v }
+        }
+        val aw = active.width()
+        val ah = active.height()
+        val zoom = zoomRatio.coerceAtLeast(0.1f)
+        val visW = aw / zoom
+        val visH = ah / zoom
+        val px = aw / 2f + (sx - 0.5f) * visW
+        val py = ah / 2f + (sy - 0.5f) * visH
+        val half = maxOf(aw, ah) / 20f
+        val left = (px - half).toInt().coerceIn(0, aw - 1)
+        val top = (py - half).toInt().coerceIn(0, ah - 1)
+        val right = (px + half).toInt().coerceIn(left + 1, aw)
+        val bottom = (py + half).toInt().coerceIn(top + 1, ah)
+        return MeteringRectangle(left, top, right - left, bottom - top, 1000)
     }
 
     private fun updateChips() {
@@ -1650,6 +1864,12 @@ class MainActivity : Activity() {
         styleChip(evChip, evText, exposure.evIndex != 0, exposure.evActive)
         styleChip(shutterChip, sText, !sAuto, true)
         styleChip(isoChip, isoText, exposure.iso != null, true)
+        val focusText = when {
+            focusManual -> "AF\n${focusLabel(focusDiopter)}"
+            afRegion != null -> "AF\nTap"
+            else -> "AF\nAuto"
+        }
+        styleChip(focusChip, focusText, focusManual || afRegion != null, true)
         sliderLabel.text = when (activeControl) {
             "ev" -> "Exposure compensation: ${exposure.evLabel(exposure.evIndex)}" +
                 if (!exposure.evActive) " (no effect while shutter and ISO are both manual)" else ""
@@ -1665,6 +1885,8 @@ class MainActivity : Activity() {
                 sAuto -> " · shutter set from the last auto reading"
                 else -> ""
             }
+            "focus" -> if (minFocusDist <= 0f) "This lens has fixed focus"
+                else if (focusManual) "Manual focus" else "Autofocus · tap the preview to focus a spot"
             else -> ""
         }
     }
@@ -1672,7 +1894,7 @@ class MainActivity : Activity() {
     private fun styleChip(c: TextView, text: String, manual: Boolean, enabled: Boolean) {
         c.text = text
         val selected = (c === evChip && activeControl == "ev") || (c === shutterChip && activeControl == "s") ||
-            (c === isoChip && activeControl == "iso")
+            (c === isoChip && activeControl == "iso") || (c === focusChip && activeControl == "focus")
         c.setTextColor(if (manual) Color.rgb(255, 196, 0) else Color.WHITE)
         c.alpha = if (enabled) 1f else 0.45f
         c.background = GradientDrawable().apply {
@@ -1903,7 +2125,7 @@ class MainActivity : Activity() {
             }
         }
         b.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
-        b.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+        applyFocus(b, video = false)
         b.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, photoFpsRange)
         // No electronic stabilization in photo mode: it would crop the preview differently from the photo.
         b.set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_OFF)
@@ -2157,7 +2379,7 @@ class MainActivity : Activity() {
                 val b = cam.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
                 b.addTarget(rr.surface)
                 b.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
-                b.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+                applyFocus(b, video = false)
                 b.set(CaptureRequest.STATISTICS_LENS_SHADING_MAP_MODE, CameraMetadata.STATISTICS_LENS_SHADING_MAP_MODE_ON)
                 applyZoom(b)
                 if (manual) {
@@ -2310,7 +2532,7 @@ class MainActivity : Activity() {
             b.addTarget(mr.surface)
             b.set(CaptureRequest.SENSOR_PIXEL_MODE, CameraMetadata.SENSOR_PIXEL_MODE_MAXIMUM_RESOLUTION)
             b.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
-            b.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+            applyFocus(b, video = false)
             applyZoom(b)
             exposure.apply(b, photoFpsRange.upper, 1_000_000_000L / photoFpsRange.upper, video = false)
             s.capture(b.build(), object : CameraCaptureSession.CaptureCallback() {
