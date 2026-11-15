@@ -150,6 +150,7 @@ class MainActivity : Activity() {
     // Measured crop of each edge-fill stream, read back from the camera's per-lens results:
     // [visible fraction along sensor X, along Y, crop-centre offset X, Y (tan units)].
     private val bgCrop = java.util.concurrent.ConcurrentHashMap<String, FloatArray>()
+    private val bgRaw = java.util.concurrent.ConcurrentHashMap<String, String>() // raw numbers, for camera info
     private lateinit var scrim: ScrimView
 
     // Photo aspect ratio: 0 = 4:3, 1 = 16:9, 2 = 1:1
@@ -1460,6 +1461,8 @@ class MainActivity : Activity() {
         if (active.width() <= 0 || active.height() <= 0 || zr <= 0f) return
         val fx = crop.width().toFloat() / active.width() / zr
         val fy = crop.height().toFloat() / active.height() / zr
+        bgRaw[id] = "crop ${crop.width()}×${crop.height()} at (${crop.left},${crop.top}), " +
+            String.format(Locale.US, "zoom %.2f, ", zr) + "sensor ${active.width()}×${active.height()}"
         // Crop-region coordinates start at the active array's top-left corner.
         val ox = (crop.exactCenterX() - active.width() / 2f) / (active.width() / 2f) * lens.tanX
         val oy = (crop.exactCenterY() - active.height() / 2f) / (active.height() / 2f) * lens.tanY
@@ -1750,6 +1753,10 @@ class MainActivity : Activity() {
         sb.append("Full-resolution photo mode: ${maxResSize ?: "not offered to apps"}\n")
         sb.append("RAW: ${rawSize ?: "not offered to apps"}\n")
         sb.append("Lenses: ${if (lenses.isEmpty()) "none offered to apps" else lenses.joinToString("; ")}\n")
+        val physKeys = try { chars.availablePhysicalCameraRequestKeys } catch (e: Exception) { null } ?: emptyList()
+        sb.append("Per-lens settings accepted: zoom ${physKeys.contains(CaptureRequest.CONTROL_ZOOM_RATIO)}, " +
+            "crop ${physKeys.contains(CaptureRequest.SCALER_CROP_REGION)}\n")
+        bgRaw.forEach { (id, raw) -> sb.append("Lens $id reports: $raw\n") }
         sb.append("Edge fill: " + when {
             bgViews.isEmpty() -> "no extra lens streams offered to apps"
             !photoMode -> "photo mode only"
