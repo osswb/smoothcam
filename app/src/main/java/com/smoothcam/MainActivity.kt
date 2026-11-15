@@ -3,6 +3,7 @@ package com.smoothcam
 import android.Manifest
 import android.annotation.SuppressLint
 import android.app.Activity
+import android.app.AlertDialog
 import android.content.ContentValues
 import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
@@ -40,6 +41,8 @@ import android.util.Range
 import android.util.Size
 import android.view.Gravity
 import android.view.KeyEvent
+import android.view.MotionEvent
+import android.view.ScaleGestureDetector
 import android.view.OrientationEventListener
 import android.view.Surface
 import android.view.SurfaceHolder
@@ -50,6 +53,8 @@ import android.view.WindowManager
 import android.widget.Button
 import android.widget.FrameLayout
 import android.widget.LinearLayout
+import android.widget.PopupMenu
+import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
 import java.io.File
@@ -62,6 +67,7 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executor
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import kotlin.math.abs
 import kotlin.math.roundToInt
 
 /**
@@ -83,7 +89,12 @@ import kotlin.math.roundToInt
  */
 class MainActivity : Activity() {
 
-    private data class VideoMode(val size: Size, val fps: Int, val fpsRange: Range<Int>, val label: String)
+    private data class VideoMode(val size: Size, val fps: Int, val fpsRange: Range<Int>, val resLabel: String) {
+        val label get() = "$resLabel $fps"
+    }
+
+    /** One way of building the video session; tried in order until the camera accepts one. */
+    private data class SessionVariant(val hdr: Boolean, val stab: Int, val previewHdr: Boolean)
 
     private lateinit var cameraManager: CameraManager
     private lateinit var cameraId: String
@@ -97,6 +108,18 @@ class MainActivity : Activity() {
     @Volatile private var hdrOn = false          // what the user wants
     @Volatile private var sessionHdr = false     // what the running session was built with
     private var aePrioritySupported = false
+
+    // Session fallback ladder (video)
+    private var variants: List<SessionVariant> = emptyList()
+    private var variantIndex = 0
+    @Volatile private var sessionStab = CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_OFF
+    private val failureLog = ArrayDeque<String>() // recent session failures, for the camera-info dialog
+    private var wantedLabel = ""                  // what the user asked for, for fallback messages
+
+    // Zoom / lenses
+    private var zoomRange: Range<Float> = Range(1f, 1f)
+    @Volatile private var zoomRatio = 1f
+    private val zoomPresets = mutableListOf<Float>()
 
     // Photo mode
     @Volatile private var photoMode = false
@@ -138,11 +161,8 @@ class MainActivity : Activity() {
     @Volatile private var recording = false
     @Volatile private var recordStart = 0L
 
-    // Exposure / 180° shutter lock
-    @Volatile private var shutterLocked = false
-    private var lockedExposureNs = 0L
-    private var lockedIso = 100
-    private var lockedBoost = 100
+    // Exposure (manual controls live in ExposureControl)
+    private lateinit var exposure: ExposureControl
     @Volatile private var lastExposureNs = 0L
     @Volatile private var lastIso = 0
     @Volatile private var lastBoost = 100
@@ -164,8 +184,21 @@ class MainActivity : Activity() {
     private lateinit var statusText: TextView
     private lateinit var recText: TextView
     private lateinit var recordButton: View
-    private lateinit var shutterButton: Button
-    private lateinit var modeButton: Button
+    private lateinit var rootView: FrameLayout
+    private lateinit var videoSettings: LinearLayout
+    private lateinit var resLabel: TextView
+    private lateinit var fpsLabel: TextView
+    private lateinit var lensRow: LinearLayout
+    private val lensButtons = mutableListOf<TextView>()
+    private lateinit var evChip: TextView
+    private lateinit var shutterChip: TextView
+    private lateinit var isoChip: TextView
+    private lateinit var sliderPanel: LinearLayout
+    private lateinit var sliderLabel: TextView
+    private lateinit var slider: SeekBar
+    private var activeControl: String? = null      // "ev", "s" or "iso" while its slider is open
+    private val rotatables = mutableListOf<View>()  // controls that turn with the phone
+    private var uiRotation = 0f
     private lateinit var hdrButton: Button
     private lateinit var maxResButton: Button
     private lateinit var photoTab: TextView
@@ -191,6 +224,7 @@ class MainActivity : Activity() {
             override fun onOrientationChanged(orientation: Int) {
                 if (orientation == OrientationEventListener.ORIENTATION_UNKNOWN) return
                 deviceOrientation = ((orientation + 45) / 90 * 90) % 360
+                applyUiRotation(deviceOrientation)
             }
         }
 
@@ -249,12 +283,24 @@ class MainActivity : Activity() {
     // ---------------------------------------------------------------- camera selection
 
     private fun pickCameraAndModes(): Boolean {
-        val id = cameraManager.cameraIdList.firstOrNull {
+        // Prefer the back camera that covers the most lenses through zoom (on Pixel: the logical
+        // multi-camera, which switches between ultrawide, main and telephoto by zoom ratio).
+        val backIds = cameraManager.cameraIdList.filter {
             cameraManager.getCameraCharacteristics(it).get(CameraCharacteristics.LENS_FACING) ==
                 CameraCharacteristics.LENS_FACING_BACK
-        } ?: return false
+        }
+        if (backIds.isEmpty()) return false
+        fun zoomOf(id: String): Range<Float> =
+            cameraManager.getCameraCharacteristics(id).get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE) ?: Range(1f, 1f)
+        val id = backIds.minWithOrNull(compareBy<String>({ zoomOf(it).lower }, { -zoomOf(it).upper })) ?: backIds[0]
         cameraId = id
         chars = cameraManager.getCameraCharacteristics(id)
+        exposure = ExposureControl(chars)
+        zoomRange = zoomOf(id)
+        zoomPresets.clear()
+        if (zoomRange.lower < 0.95f) zoomPresets += zoomRange.lower
+        zoomPresets += 1f
+        for (z in listOf(2f, 5f, 10f)) if (zoomRange.upper >= z) zoomPresets += z
         sensorOrientation = chars.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
 
         val map = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP) ?: return false
@@ -272,13 +318,11 @@ class MainActivity : Activity() {
 
         val uhd = Size(3840, 2160)
         val fhd = Size(1920, 1080)
-        rangeFor(60)?.let { r ->
-            if (supports(uhd, 60)) modes += VideoMode(uhd, 60, r, "4K 60")
-            if (supports(fhd, 60)) modes += VideoMode(fhd, 60, r, "1080p 60")
-        }
-        rangeFor(30)?.let { r ->
-            if (supports(uhd, 30)) modes += VideoMode(uhd, 30, r, "4K 30")
-            if (supports(fhd, 30)) modes += VideoMode(fhd, 30, r, "1080p 30")
+        // Order = fallback order: highest frame rate first, then resolution.
+        for (fps in listOf(60, 30, 24)) {
+            val r = rangeFor(fps) ?: continue
+            if (supports(uhd, fps)) modes += VideoMode(uhd, fps, r, "4K")
+            if (supports(fhd, fps)) modes += VideoMode(fhd, fps, r, "1080p")
         }
         if (modes.isEmpty()) return false
 
@@ -394,6 +438,55 @@ class MainActivity : Activity() {
         }
     }
 
+    /**
+     * Ways to build the video session, best first. A camera may accept 4K 60 HDR only with a
+     * particular stabilization mode, or only with an SDR viewfinder, so we try those before giving
+     * up on HDR. The first variant the camera accepts wins.
+     */
+    private fun buildVariants(hdrWanted: Boolean): List<SessionVariant> {
+        val available = chars.get(CameraCharacteristics.CONTROL_AVAILABLE_VIDEO_STABILIZATION_MODES) ?: intArrayOf()
+        val stabs = listOf(
+            CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_PREVIEW_STABILIZATION,
+            CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_ON,
+            CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_OFF,
+        ).filter { it == CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_OFF || available.contains(it) }
+        val out = mutableListOf<SessionVariant>()
+        if (hdrWanted && hdrSupported) {
+            for (st in stabs) out += SessionVariant(hdr = true, stab = st, previewHdr = true)
+            // HDR recording with an SDR viewfinder, if the camera allows mixing the two.
+            val constraints = chars.get(CameraCharacteristics.REQUEST_AVAILABLE_DYNAMIC_RANGE_PROFILES)
+                ?.getProfileCaptureRequestConstraints(DynamicRangeProfiles.HLG10)
+            if (constraints?.contains(DynamicRangeProfiles.STANDARD) == true) {
+                for (st in stabs) out += SessionVariant(hdr = true, stab = st, previewHdr = false)
+            }
+        }
+        for (st in stabs) out += SessionVariant(hdr = false, stab = st, previewHdr = false)
+        return out
+    }
+
+    /** Camera thread. Start the current video mode from the best variant. */
+    private fun restartVideo() {
+        variants = buildVariants(hdrOn)
+        variantIndex = 0
+        wantedLabel = modeName(modes[modeIndex], hdrOn && hdrSupported)
+        startSession()
+    }
+
+    private fun stabName(st: Int) = when (st) {
+        CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_PREVIEW_STABILIZATION -> "preview stabilization"
+        CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_ON -> "standard stabilization"
+        else -> "no electronic stabilization"
+    }
+
+    private fun logFailure(msg: String, e: Throwable? = null) {
+        val line = if (e != null) "$msg: ${e.javaClass.simpleName} ${e.message}" else msg
+        Log.w(TAG, line, e)
+        synchronized(failureLog) {
+            failureLog.addLast(line)
+            while (failureLog.size > 12) failureLog.removeFirst()
+        }
+    }
+
     /** Runs on the camera thread. Creates one session with both the preview and the recorder surface. */
     private fun startSession() {
         if (photoMode) {
@@ -402,7 +495,13 @@ class MainActivity : Activity() {
         }
         closePhotoReader()
         val cam = device ?: return
+        if (variants.isEmpty()) {
+            variants = buildVariants(hdrOn)
+            variantIndex = 0
+            wantedLabel = modeName(modes[modeIndex], hdrOn && hdrSupported)
+        }
         val mode = modes[modeIndex]
+        val variant = variants[variantIndex]
         session?.close()
         session = null
         lastTs = 0L; frameCount = 0; accumNs = 0L
@@ -410,7 +509,7 @@ class MainActivity : Activity() {
         // A persistent encoder surface lets us start and stop many recordings without
         // rebuilding the capture session, so the viewfinder never hiccups when you press record.
         val oldSurface = recordSurface
-        val hdr = hdrOn
+        val hdr = variant.hdr
         val rs = MediaCodec.createPersistentInputSurface()
         try {
             if (hdr) {
@@ -424,9 +523,15 @@ class MainActivity : Activity() {
                 probe.delete()
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Recorder probe failed for ${mode.label} hdr=$hdr", e)
+            logFailure("Encoder rejected ${modeName(mode, hdr)}", e)
             rs.release()
-            fallBackOrFail("Encoder can't do ${modeName(mode, hdr)}")
+            if (hdr) {
+                // The encoder itself can't do HDR here: skip the remaining HDR variants.
+                variantIndex = variants.indexOfFirst { !it.hdr }.coerceAtLeast(variantIndex)
+                nextVariantOrFallBack(alreadyAdvanced = true)
+            } else {
+                nextVariantOrFallBack()
+            }
             return
         }
         recordSurface = rs
@@ -434,17 +539,18 @@ class MainActivity : Activity() {
 
         val preview = surfaceView.holder.surface
         val params = cam.createCaptureRequest(CameraDevice.TEMPLATE_RECORD)
-        applyControls(params, mode)
+        applyControls(params, mode, variant.stab)
 
         val previewConfig = OutputConfiguration(preview)
         val recordConfig = OutputConfiguration(rs)
         if (hdr) {
-            previewConfig.setDynamicRangeProfile(DynamicRangeProfiles.HLG10)
+            if (variant.previewHdr) previewConfig.setDynamicRangeProfile(DynamicRangeProfiles.HLG10)
             recordConfig.setDynamicRangeProfile(DynamicRangeProfiles.HLG10)
             // HdrRecorder times audio with System.nanoTime(), so ask for video timestamps on the same clock.
             recordConfig.setTimestampBase(OutputConfiguration.TIMESTAMP_BASE_MONOTONIC)
         }
         val outputs = listOf(previewConfig, recordConfig)
+        val desc = "${modeName(mode, hdr)}${if (hdr && !variant.previewHdr) " (SDR viewfinder)" else ""}, ${stabName(variant.stab)}"
         val config = SessionConfiguration(
             SessionConfiguration.SESSION_REGULAR,
             outputs,
@@ -457,11 +563,13 @@ class MainActivity : Activity() {
                         return
                     }
                     session = s
+                    sessionStab = variant.stab
                     setRepeating(withRecord = false)
+                    reportVariantResult(mode, variant)
                     mainHandler.post {
                         applyFrameRateHint(mode.fps)
                         // Let the window use the screen's HDR brightness headroom for the preview.
-                        window.colorMode = if (hdr) ActivityInfo.COLOR_MODE_HDR else ActivityInfo.COLOR_MODE_DEFAULT
+                        window.colorMode = if (hdr && variant.previewHdr) ActivityInfo.COLOR_MODE_HDR else ActivityInfo.COLOR_MODE_DEFAULT
                         updateButtons()
                         updateStatus()
                     }
@@ -469,17 +577,59 @@ class MainActivity : Activity() {
 
                 override fun onConfigureFailed(s: CameraCaptureSession) {
                     oldSurface?.release()
-                    fallBackOrFail("Camera can't do ${modeName(mode, hdr)}")
+                    logFailure("Camera rejected session: $desc")
+                    nextVariantOrFallBack()
                 }
             }
         )
         // Session parameters let the camera pick its 60 fps sensor mode up front.
         config.setSessionParameters(params.build())
         try {
+            // Ask first when possible: much faster than letting a full session setup fail.
+            val supported = try { cam.isSessionConfigurationSupported(config) } catch (e: Exception) { true }
+            if (!supported) {
+                oldSurface?.release()
+                logFailure("Camera reports unsupported: $desc")
+                nextVariantOrFallBack()
+                return
+            }
             cam.createCaptureSession(config)
         } catch (e: Exception) {
-            Log.e(TAG, "createCaptureSession failed", e)
-            fallBackOrFail("Camera can't do ${modeName(mode, hdr)}")
+            logFailure("createCaptureSession failed: $desc", e)
+            nextVariantOrFallBack()
+        }
+    }
+
+    /** Camera thread. Tell the user only when we had to give something up. */
+    private fun reportVariantResult(mode: VideoMode, v: SessionVariant) {
+        val first = variants.firstOrNull() ?: return
+        if (v == first) return
+        val got = modeName(mode, v.hdr)
+        val msg = when {
+            first.hdr && v.hdr && !v.previewHdr -> "$got: recording HDR with an SDR viewfinder (the camera won't preview HDR here)"
+            first.hdr && v.hdr -> "$got works with ${stabName(v.stab)} only"
+            first.hdr && !v.hdr -> "The camera doesn't offer ${modeName(mode, true)} to apps; using SDR. Tap the status bar for details."
+            else -> "$got works with ${stabName(v.stab)} only"
+        }
+        if (first.hdr && !v.hdr) hdrOn = false
+        toast(msg)
+    }
+
+    /** Camera thread. Try the next variant; when none are left, step down to the next video mode. */
+    private fun nextVariantOrFallBack(alreadyAdvanced: Boolean = false) {
+        if (!alreadyAdvanced) variantIndex++
+        if (variantIndex < variants.size) {
+            startSession()
+            return
+        }
+        if (modeIndex < modes.size - 1) {
+            modeIndex++
+            variants = buildVariants(hdrOn)
+            variantIndex = 0
+            toast("Camera can't do $wantedLabel, trying ${modes[modeIndex].label}")
+            startSession()
+        } else {
+            showStatus("No working video mode found. Tap here for details.")
         }
     }
 
@@ -492,63 +642,34 @@ class MainActivity : Activity() {
         return if (hdr) scaled * 5 / 4 else scaled
     }
 
-    /** Camera thread. First drop HDR at the current resolution, then step down the resolution list. */
-    private fun fallBackOrFail(reason: String) {
-        if (hdrOn) {
-            hdrOn = false
-            toast("$reason, using ${modes[modeIndex].label} SDR")
-            startSession()
-        } else if (modeIndex < modes.size - 1) {
-            modeIndex++
-            toast("$reason, using ${modes[modeIndex].label}")
-            startSession()
-        } else {
-            showStatus("$reason. No working video mode found.")
-        }
-    }
-
-    private fun applyControls(b: CaptureRequest.Builder, mode: VideoMode) {
+    private fun applyControls(b: CaptureRequest.Builder, mode: VideoMode, stab: Int = sessionStab) {
         b.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
         b.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
         b.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, mode.fpsRange)
-
-        val stabModes = chars.get(CameraCharacteristics.CONTROL_AVAILABLE_VIDEO_STABILIZATION_MODES) ?: intArrayOf()
-        val stab = when {
-            stabModes.contains(CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_PREVIEW_STABILIZATION) ->
-                CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_PREVIEW_STABILIZATION
-            stabModes.contains(CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_ON) ->
-                CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_ON
-            else -> CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_OFF
-        }
         b.set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, stab)
+        applyOis(b)
+        applyZoom(b)
+        exposure.apply(b, mode.fps, 1_000_000_000L / mode.fps, video = true)
+    }
 
+    private fun applyOis(b: CaptureRequest.Builder) {
         val ois = chars.get(CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION) ?: intArrayOf()
         if (ois.contains(CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_ON)) {
             b.set(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE, CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_ON)
         }
+    }
 
-        if (shutterLocked && aePrioritySupported && Build.VERSION.SDK_INT >= 36) {
-            // Shutter priority: we fix the exposure time, auto-exposure keeps adjusting ISO.
-            b.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_ON)
-            b.set(
-                CaptureRequest.CONTROL_AE_PRIORITY_MODE,
-                CameraMetadata.CONTROL_AE_PRIORITY_MODE_SENSOR_EXPOSURE_TIME_PRIORITY
-            )
-            b.set(CaptureRequest.SENSOR_EXPOSURE_TIME, 1_000_000_000L / (2L * mode.fps))
-        } else if (shutterLocked) {
-            b.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_OFF)
-            b.set(CaptureRequest.SENSOR_EXPOSURE_TIME, lockedExposureNs)
-            b.set(CaptureRequest.SENSOR_SENSITIVITY, lockedIso)
-            b.set(CaptureRequest.SENSOR_FRAME_DURATION, 1_000_000_000L / mode.fps)
-            chars.get(CameraCharacteristics.CONTROL_POST_RAW_SENSITIVITY_BOOST_RANGE)?.let { r ->
-                b.set(CaptureRequest.CONTROL_POST_RAW_SENSITIVITY_BOOST, lockedBoost.coerceIn(r.lower, r.upper))
-            }
-        } else {
-            b.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_ON)
-            if (aePrioritySupported && Build.VERSION.SDK_INT >= 36) {
-                b.set(CaptureRequest.CONTROL_AE_PRIORITY_MODE, CameraMetadata.CONTROL_AE_PRIORITY_MODE_OFF)
-            }
+    private fun applyZoom(b: CaptureRequest.Builder) {
+        if (zoomRange.upper > zoomRange.lower) {
+            b.set(CaptureRequest.CONTROL_ZOOM_RATIO, zoomRatio.coerceIn(zoomRange.lower, zoomRange.upper))
         }
+    }
+
+    /** Camera thread. Re-issue the repeating request soon, coalescing rapid changes (pinch, sliders). */
+    private val repeatUpdate = Runnable { setRepeating(recording) }
+    private fun requestRepeatingUpdate() {
+        cameraHandler.removeCallbacks(repeatUpdate)
+        cameraHandler.post(repeatUpdate)
     }
 
     private fun setRepeating(withRecord: Boolean) {
@@ -577,6 +698,11 @@ class MainActivity : Activity() {
             result.get(CaptureResult.SENSOR_EXPOSURE_TIME)?.let { lastExposureNs = it }
             result.get(CaptureResult.SENSOR_SENSITIVITY)?.let { lastIso = it }
             result.get(CaptureResult.CONTROL_POST_RAW_SENSITIVITY_BOOST)?.let { lastBoost = it }
+            if (exposure.isFullyAuto) {
+                exposure.lastAutoExposureNs = lastExposureNs
+                exposure.lastAutoIso = lastIso
+                exposure.lastAutoBoost = lastBoost
+            }
 
             val ts = result.get(CaptureResult.SENSOR_TIMESTAMP) ?: return
             if (lastTs != 0L) {
@@ -601,51 +727,6 @@ class MainActivity : Activity() {
         device?.close()
         device = null
         lastTs = 0L
-    }
-
-    // ---------------------------------------------------------------- 180° shutter
-
-    /**
-     * Toggle the 180° shutter lock. When turning it on, we take the brightness the auto-exposure
-     * just settled on (exposure time x ISO) and re-balance it so exposure time = 1 / (2 x fps).
-     */
-    private fun toggleShutterLock() {
-        if (shutterLocked) {
-            shutterLocked = false
-        } else if (aePrioritySupported) {
-            shutterLocked = true // no metering needed: auto-exposure keeps running at the fixed shutter
-        } else {
-            val exp = lastExposureNs
-            val iso = lastIso
-            if (exp <= 0L || iso <= 0) {
-                toast("Still metering, try again")
-                return
-            }
-            val mode = modes[modeIndex]
-            val frameNs = 1_000_000_000L / mode.fps
-            val targetNs = frameNs / 2 // 180° shutter
-            val isoRange = chars.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE) ?: Range(50, 3200)
-            val expRange = chars.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE) ?: Range(100_000L, frameNs)
-
-            val light = exp.toDouble() * iso
-            var newExp = targetNs
-            var newIso = (light / targetNs).roundToInt()
-            if (newIso > isoRange.upper) {
-                // Too dark for 180°: use the longest exposure the frame rate allows.
-                newIso = isoRange.upper
-                newExp = (light / newIso).toLong().coerceAtMost(frameNs - 500_000L)
-            } else if (newIso < isoRange.lower) {
-                // Too bright for 180° without an ND filter: shorten exposure as little as possible.
-                newIso = isoRange.lower
-                newExp = (light / newIso).toLong()
-            }
-            lockedExposureNs = newExp.coerceIn(expRange.lower, expRange.upper)
-            lockedIso = newIso
-            lockedBoost = lastBoost
-            shutterLocked = true
-        }
-        setRepeating(recording)
-        mainHandler.post { updateButtons() }
     }
 
     // ---------------------------------------------------------------- recording
@@ -777,6 +858,7 @@ class MainActivity : Activity() {
     private fun buildUi() {
         val root = FrameLayout(this)
         root.setBackgroundColor(Color.BLACK)
+        rootView = root
 
         // Portrait UI: the 16:9 sensor image is shown rotated, so the view is 9:16.
         val w = resources.displayMetrics.widthPixels
@@ -784,6 +866,18 @@ class MainActivity : Activity() {
         surfaceView = SurfaceView(this)
         root.addView(surfaceView, FrameLayout.LayoutParams(w, h, Gravity.CENTER))
         surfaceView.holder.setFixedSize(previewSize.width, previewSize.height)
+        // Pinch to zoom; the camera switches lenses by itself as the zoom ratio crosses them.
+        val scaleDetector = ScaleGestureDetector(this, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
+            override fun onScale(detector: ScaleGestureDetector): Boolean {
+                setZoom(zoomRatio * detector.scaleFactor)
+                return true
+            }
+        })
+        surfaceView.setOnTouchListener { v, e ->
+            scaleDetector.onTouchEvent(e)
+            if (e.actionMasked == MotionEvent.ACTION_UP) v.performClick()
+            true
+        }
         surfaceView.holder.addCallback(object : SurfaceHolder.Callback {
             override fun surfaceCreated(holder: SurfaceHolder) {
                 surfaceReady = true
@@ -820,6 +914,7 @@ class MainActivity : Activity() {
                 cornerRadius = dp(12).toFloat()
             }
             text = "Starting camera…"
+            setOnClickListener { showCameraInfo() }
         }
         root.addView(statusText, FrameLayout.LayoutParams(
             ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
@@ -841,28 +936,104 @@ class MainActivity : Activity() {
             Gravity.TOP or Gravity.CENTER_HORIZONTAL
         ).apply { topMargin = dp(92) })
 
-        val bar = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-        }
-        modeButton = pillButton().apply {
-            setOnClickListener { cameraHandler.post { cycleMode() } }
-        }
         recordButton = View(this).apply {
             setOnClickListener { shutterPressed() }
         }
-        shutterButton = pillButton().apply {
-            setOnClickListener { cameraHandler.post { toggleShutterLock() } }
-        }
-        bar.addView(modeButton, LinearLayout.LayoutParams(dp(110), dp(44)))
-        bar.addView(recordButton, LinearLayout.LayoutParams(dp(76), dp(76)).apply {
-            leftMargin = dp(24); rightMargin = dp(24)
-        })
-        bar.addView(shutterButton, LinearLayout.LayoutParams(dp(110), dp(44)))
-        root.addView(bar, FrameLayout.LayoutParams(
-            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+        root.addView(recordButton, FrameLayout.LayoutParams(dp(76), dp(76),
             Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
         ).apply { bottomMargin = dp(56) })
+
+        // Resolution and frame rate, top right, each with its own menu (like iPhone's "4K · 60").
+        videoSettings = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        resLabel = settingLabel().apply { setOnClickListener { showResolutionMenu(it) } }
+        fpsLabel = settingLabel().apply { setOnClickListener { showFpsMenu(it) } }
+        videoSettings.addView(resLabel, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(34)))
+        videoSettings.addView(fpsLabel, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(34)).apply {
+            leftMargin = dp(8)
+        })
+        root.addView(videoSettings, FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+            Gravity.TOP or Gravity.END
+        ).apply { topMargin = dp(92); rightMargin = dp(16) })
+
+        // Lens / zoom presets (0.5x, 1x, 2x, 5x...). Pinch works too.
+        lensRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            setPadding(dp(4), dp(4), dp(4), dp(4))
+            background = GradientDrawable().apply {
+                setColor(Color.argb(110, 0, 0, 0))
+                cornerRadius = dp(24).toFloat()
+            }
+        }
+        for (z in zoomPresets) {
+            val t = TextView(this).apply {
+                gravity = Gravity.CENTER
+                textSize = 12f
+                setTextColor(Color.WHITE)
+                setOnClickListener { setZoom(z) }
+            }
+            lensButtons += t
+            lensRow.addView(t, LinearLayout.LayoutParams(dp(40), dp(40)).apply {
+                leftMargin = dp(2); rightMargin = dp(2)
+            })
+        }
+        if (zoomPresets.size < 2) lensRow.visibility = View.GONE
+        root.addView(lensRow, FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+            Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
+        ).apply { bottomMargin = dp(194) })
+
+        // Manual exposure: tap a chip to open its slider, long-press to reset it to auto.
+        val chipRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+        }
+        evChip = chip("ev")
+        shutterChip = chip("s")
+        isoChip = chip("iso")
+        for (c in listOf(evChip, shutterChip, isoChip)) {
+            chipRow.addView(c, LinearLayout.LayoutParams(dp(96), dp(34)).apply {
+                leftMargin = dp(4); rightMargin = dp(4)
+            })
+        }
+        root.addView(chipRow, FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+            Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
+        ).apply { bottomMargin = dp(248) })
+
+        sliderPanel = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(8), dp(16), dp(8))
+            background = GradientDrawable().apply {
+                setColor(Color.argb(170, 0, 0, 0))
+                cornerRadius = dp(16).toFloat()
+            }
+            visibility = View.GONE
+        }
+        sliderLabel = TextView(this).apply {
+            gravity = Gravity.CENTER
+            setTextColor(Color.WHITE)
+            textSize = 14f
+        }
+        slider = SeekBar(this).apply {
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(bar: SeekBar, progress: Int, fromUser: Boolean) {
+                    if (fromUser) applySlider(progress)
+                }
+                override fun onStartTrackingTouch(bar: SeekBar) {}
+                override fun onStopTrackingTouch(bar: SeekBar) {}
+            })
+        }
+        sliderPanel.addView(sliderLabel, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        sliderPanel.addView(slider, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(36)))
+        root.addView(sliderPanel, FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+            Gravity.BOTTOM
+        ).apply { bottomMargin = dp(292); leftMargin = dp(24); rightMargin = dp(24) })
 
         hdrButton = pillButton().apply {
             setOnClickListener { cameraHandler.post { toggleHdr() } }
@@ -895,8 +1066,35 @@ class MainActivity : Activity() {
         ).apply { bottomMargin = dp(146) })
 
         setContentView(root)
+        rotatables += listOf(recText, hdrButton, maxResButton, resLabel, fpsLabel, evChip, shutterChip, isoChip,
+            photoTab, videoTab, sliderLabel)
+        rotatables += lensButtons
         styleRecordButton(false)
         updateButtons()
+    }
+
+    private fun settingLabel() = TextView(this).apply {
+        gravity = Gravity.CENTER
+        textSize = 14f
+        setTypeface(typeface, android.graphics.Typeface.BOLD)
+        setTextColor(Color.WHITE)
+        setPadding(dp(12), 0, dp(12), 0)
+        background = GradientDrawable().apply {
+            setColor(Color.argb(140, 0, 0, 0))
+            cornerRadius = dp(17).toFloat()
+            setStroke(dp(1), Color.argb(120, 255, 255, 255))
+        }
+    }
+
+    private fun chip(which: String) = TextView(this).apply {
+        gravity = Gravity.CENTER
+        textSize = 12f
+        setTextColor(Color.WHITE)
+        setOnClickListener { toggleControl(which) }
+        setOnLongClickListener {
+            resetControl(which)
+            true
+        }
     }
 
     private fun pillButton() = Button(this).apply {
@@ -938,9 +1136,13 @@ class MainActivity : Activity() {
     }
 
     private fun updateButtons() {
-        val videoVis = if (photoMode) View.INVISIBLE else View.VISIBLE
-        modeButton.visibility = videoVis
-        shutterButton.visibility = videoVis
+        val m = modes[modeIndex]
+        videoSettings.visibility = if (photoMode) View.GONE else View.VISIBLE
+        resLabel.text = m.resLabel
+        fpsLabel.text = "${m.fps}"
+        val idleAlpha = if (recording) 0.4f else 1f
+        resLabel.alpha = idleAlpha
+        fpsLabel.alpha = idleAlpha
         hdrButton.visibility = if (photoMode || !hdrSupported) View.GONE else View.VISIBLE
         maxResButton.visibility = if (photoMode && maxResSize != null) View.VISIBLE else View.GONE
         maxResSize?.let { maxResButton.text = String.format(Locale.US, "%.0f MP", it.width * it.height / 1_000_000.0) }
@@ -950,22 +1152,266 @@ class MainActivity : Activity() {
         val tabsEnabled = !recording
         photoTab.isEnabled = tabsEnabled
         videoTab.isEnabled = tabsEnabled
-        photoTab.alpha = if (tabsEnabled) 1f else 0.4f
-        videoTab.alpha = if (tabsEnabled) 1f else 0.4f
-        modeButton.text = modes[modeIndex].label
-        stylePill(modeButton, false)
-        modeButton.isEnabled = !recording
-        modeButton.alpha = if (recording) 0.4f else 1f
-        shutterButton.text = when {
-            !shutterLocked -> "Auto exposure"
-            aePrioritySupported -> "180° auto ISO"
-            else -> "180° locked"
-        }
-        stylePill(shutterButton, shutterLocked)
+        photoTab.alpha = idleAlpha
+        videoTab.alpha = idleAlpha
         hdrButton.text = if (hdrOn) "HDR" else "SDR"
         stylePill(hdrButton, hdrOn)
         hdrButton.isEnabled = !recording
-        hdrButton.alpha = if (recording) 0.4f else 1f
+        hdrButton.alpha = idleAlpha
+        updateChips()
+        updateLensButtons()
+    }
+
+    // ---------------------------------------------------------------- resolution / frame rate menus
+
+    private fun showResolutionMenu(anchor: View) {
+        if (recording) return
+        val labels = modes.map { it.resLabel }.distinct()
+        val pm = PopupMenu(this, anchor)
+        labels.forEachIndexed { i, l ->
+            pm.menu.add(0, i, i, l).apply {
+                isCheckable = true
+                isChecked = l == modes[modeIndex].resLabel
+            }
+        }
+        pm.setOnMenuItemClickListener { item ->
+            selectMode(labels[item.itemId], modes[modeIndex].fps)
+            true
+        }
+        pm.show()
+    }
+
+    private fun showFpsMenu(anchor: View) {
+        if (recording) return
+        val cur = modes[modeIndex]
+        val fpsList = modes.filter { it.resLabel == cur.resLabel }.map { it.fps }.distinct().sortedDescending()
+        val pm = PopupMenu(this, anchor)
+        fpsList.forEachIndexed { i, f ->
+            pm.menu.add(0, i, i, "$f fps").apply {
+                isCheckable = true
+                isChecked = f == cur.fps
+            }
+        }
+        pm.setOnMenuItemClickListener { item ->
+            selectMode(cur.resLabel, fpsList[item.itemId])
+            true
+        }
+        pm.show()
+    }
+
+    /** Main thread. Resolution and frame rate are chosen independently; keep the other one when possible. */
+    private fun selectMode(res: String, fps: Int) {
+        val exact = modes.indexOfFirst { it.resLabel == res && it.fps == fps }
+        val idx = if (exact >= 0) exact else modes.indexOfFirst { it.resLabel == res } // modes are sorted by fps, high first
+        if (idx < 0 || idx == modeIndex) return
+        modeIndex = idx
+        if (exact < 0) toast("$res doesn't support $fps fps here, using ${modes[idx].fps} fps")
+        updateButtons()
+        cameraHandler.post { restartVideo() }
+    }
+
+    // ---------------------------------------------------------------- zoom
+
+    /** Main thread. */
+    private fun setZoom(z: Float) {
+        zoomRatio = z.coerceIn(zoomRange.lower, zoomRange.upper)
+        updateLensButtons()
+        requestRepeatingUpdate()
+    }
+
+    private fun zoomLabel(z: Float): String = when {
+        z < 1f -> String.format(Locale.US, "%.1f", z).removePrefix("0")
+        abs(z - z.roundToInt()) < 0.05f -> "${z.roundToInt()}×"
+        else -> String.format(Locale.US, "%.1f×", z)
+    }
+
+    private fun updateLensButtons() {
+        if (lensButtons.isEmpty()) return
+        // The active button is the largest preset not above the current zoom; it shows the exact zoom.
+        var active = 0
+        zoomPresets.forEachIndexed { i, p -> if (zoomRatio >= p - 0.01f) active = i }
+        lensButtons.forEachIndexed { i, t ->
+            val on = i == active
+            t.text = if (on) zoomLabel(zoomRatio) else zoomLabel(zoomPresets[i])
+            t.setTextColor(if (on) Color.rgb(255, 196, 0) else Color.WHITE)
+            t.background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(if (on) Color.argb(200, 30, 30, 30) else Color.argb(90, 0, 0, 0))
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------- manual exposure UI
+
+    private fun currentFps(): Int = if (photoMode) photoFpsRange.upper else modes[modeIndex].fps
+    private fun shutterOpts() = exposure.shutterOptions(currentFps(), video = !photoMode)
+    private fun isoOpts() = exposure.isoOptions()
+    private fun evOpts() = exposure.evOptions()
+
+    private fun toggleControl(which: String) {
+        if (activeControl == which) {
+            activeControl = null
+            sliderPanel.visibility = View.GONE
+            updateChips()
+            return
+        }
+        val (count, index) = when (which) {
+            "ev" -> evOpts().size to evOpts().indexOf(exposure.evIndex)
+            "s" -> shutterOpts().size to shutterOpts().indexOf(exposure.shutter)
+            else -> isoOpts().size to isoOpts().indexOf(exposure.iso)
+        }
+        if (count < 2) {
+            toast("This camera doesn't allow changing that")
+            return
+        }
+        activeControl = which
+        slider.max = count - 1
+        slider.progress = index.coerceAtLeast(0)
+        sliderPanel.visibility = View.VISIBLE
+        updateChips()
+    }
+
+    private fun applySlider(i: Int) {
+        when (activeControl) {
+            "ev" -> evOpts().getOrNull(i)?.let { exposure.evIndex = it }
+            "s" -> shutterOpts().getOrNull(i)?.let {
+                exposure.freezeIfLeavingAuto()
+                exposure.shutter = it
+            }
+            "iso" -> if (i in isoOpts().indices) {
+                exposure.freezeIfLeavingAuto()
+                exposure.iso = isoOpts()[i]
+            }
+        }
+        updateChips()
+        requestRepeatingUpdate()
+    }
+
+    private fun resetControl(which: String) {
+        when (which) {
+            "ev" -> exposure.evIndex = 0
+            "s" -> exposure.shutter = ExposureControl.Shutter.Auto
+            else -> exposure.iso = null
+        }
+        if (activeControl == which) {
+            val idx = when (which) {
+                "ev" -> evOpts().indexOf(0)
+                else -> 0
+            }
+            slider.progress = idx.coerceAtLeast(0)
+        }
+        updateChips()
+        requestRepeatingUpdate()
+        toast("${which.uppercase(Locale.US)} reset to auto")
+    }
+
+    private fun updateChips() {
+        val fps = currentFps()
+        val sAuto = exposure.shutter == ExposureControl.Shutter.Auto
+        val evText = "EV ${exposure.evLabel(exposure.evIndex)}"
+        val sText = if (sAuto) "S Auto" else "S ${exposure.shutterLabel(exposure.shutter, fps).substringBefore(" (")}"
+        val isoText = exposure.iso?.let { "ISO $it" } ?: "ISO Auto"
+        styleChip(evChip, evText, exposure.evIndex != 0, exposure.evActive)
+        styleChip(shutterChip, sText, !sAuto, true)
+        styleChip(isoChip, isoText, exposure.iso != null, true)
+        sliderLabel.text = when (activeControl) {
+            "ev" -> "Exposure compensation: ${exposure.evLabel(exposure.evIndex)}" +
+                if (!exposure.evActive) " (no effect while shutter and ISO are both manual)" else ""
+            "s" -> "Shutter: ${exposure.shutterLabel(exposure.shutter, fps)}" + when {
+                sAuto -> ""
+                exposure.iso == null && exposure.shutterPriority -> " · ISO stays automatic"
+                exposure.iso == null -> " · ISO set from the last auto reading"
+                else -> ""
+            }
+            "iso" -> "ISO: ${exposure.iso ?: "Auto"}" + when {
+                exposure.iso == null -> ""
+                sAuto && exposure.isoPriority -> " · shutter stays automatic"
+                sAuto -> " · shutter set from the last auto reading"
+                else -> ""
+            }
+            else -> ""
+        }
+    }
+
+    private fun styleChip(c: TextView, text: String, manual: Boolean, enabled: Boolean) {
+        c.text = text
+        val selected = (c === evChip && activeControl == "ev") || (c === shutterChip && activeControl == "s") ||
+            (c === isoChip && activeControl == "iso")
+        c.setTextColor(if (manual) Color.rgb(255, 196, 0) else Color.WHITE)
+        c.alpha = if (enabled) 1f else 0.45f
+        c.background = GradientDrawable().apply {
+            setColor(if (selected) Color.argb(220, 40, 40, 40) else Color.argb(130, 0, 0, 0))
+            cornerRadius = dp(17).toFloat()
+            setStroke(dp(1), if (selected) Color.rgb(255, 196, 0) else Color.argb(90, 255, 255, 255))
+        }
+    }
+
+    // ---------------------------------------------------------------- orientation
+
+    /** Main thread. Turn the controls in place to match how the phone is held (the layout itself stays put). */
+    private fun applyUiRotation(o: Int) {
+        val target = when (o) {
+            90 -> -90f
+            270 -> 90f
+            180 -> 180f
+            else -> 0f
+        }
+        if (target == uiRotation) return
+        uiRotation = target
+        for (v in rotatables) v.animate().rotation(target).setDuration(250).start()
+        positionStatus()
+    }
+
+    /** In landscape, move the info bar to the edge that is now "up" so it reads naturally and isn't clipped. */
+    private fun positionStatus() {
+        val v = statusText
+        val rw = rootView.width.toFloat()
+        val rh = rootView.height.toFloat()
+        val cx0 = v.left + v.width / 2f
+        val cy0 = v.top + v.height / 2f
+        val margin = dp(12).toFloat()
+        val tx: Float
+        val ty: Float
+        when (uiRotation) {
+            -90f -> { tx = margin + v.height / 2f - cx0; ty = rh / 2f - cy0 }
+            90f -> { tx = rw - margin - v.height / 2f - cx0; ty = rh / 2f - cy0 }
+            else -> { tx = 0f; ty = 0f }
+        }
+        v.animate().rotation(uiRotation).translationX(tx).translationY(ty).setDuration(250).start()
+    }
+
+    // ---------------------------------------------------------------- camera info
+
+    private fun showCameraInfo() {
+        val sb = StringBuilder()
+        sb.append("Camera in use: $cameraId (all: ${cameraManager.cameraIdList.joinToString()})\n")
+        val physical = try { chars.physicalCameraIds.joinToString() } catch (e: Exception) { "" }
+        sb.append("Lenses behind it: ${physical.ifEmpty { "none listed" }}\n")
+        val focal = chars.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.joinToString { String.format(Locale.US, "%.1f", it) }
+        sb.append("Focal lengths (mm): ${focal ?: "?"}\n")
+        sb.append("Zoom range: ${zoomRange.lower}–${zoomRange.upper}\n")
+        val fpsRanges = chars.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)?.joinToString() ?: "?"
+        sb.append("Frame-rate ranges: $fpsRanges\n")
+        sb.append("Video modes: ${modes.joinToString { it.label }}\n")
+        sb.append("10-bit HLG HDR: ${if (hdrSupported) "yes" else "no"}\n")
+        val stabs = chars.get(CameraCharacteristics.CONTROL_AVAILABLE_VIDEO_STABILIZATION_MODES)?.joinToString { stabName(it) } ?: "?"
+        sb.append("Stabilization: $stabs\n")
+        sb.append("Shutter priority: ${exposure.shutterPriority}, ISO priority: ${exposure.isoPriority}\n")
+        sb.append("ISO ${exposure.isoRange}, shutter ${ExposureControl.formatShutter(exposure.expRange.lower)}–${ExposureControl.formatShutter(exposure.expRange.upper)}\n")
+        sb.append("Full-resolution photo mode: ${maxResSize ?: "not offered to apps"}\n")
+        if (!photoMode) {
+            sb.append("\nAsked for: $wantedLabel\nRunning: ${modeName(modes[modeIndex], sessionHdr)}, ${stabName(sessionStab)}\n")
+        }
+        val failures = synchronized(failureLog) { failureLog.toList() }
+        if (failures.isNotEmpty()) {
+            sb.append("\nRecent camera refusals:\n")
+            failures.forEach { sb.append("• ").append(it).append("\n") }
+        }
+        AlertDialog.Builder(this)
+            .setTitle("Camera info")
+            .setMessage(sb.toString())
+            .setPositiveButton("OK", null)
+            .show()
     }
 
     private fun updateStatus() {
@@ -981,6 +1427,7 @@ class MainActivity : Activity() {
         val mode = modes[modeIndex]
         val exp = lastExposureNs
         val parts = mutableListOf(modeName(mode, sessionHdr))
+        if (abs(zoomRatio - 1f) > 0.04f) parts += zoomLabel(zoomRatio)
         if (measuredFps > 0) parts += String.format(Locale.US, "%.1f fps", measuredFps)
         if (exp > 0) {
             val denom = (1e9 / exp).roundToInt()
@@ -1011,15 +1458,6 @@ class MainActivity : Activity() {
         }
     }
 
-    /** Camera thread. Switch resolution / frame rate (not while recording). */
-    private fun cycleMode() {
-        if (recording || modes.size < 2) return
-        modeIndex = (modeIndex + 1) % modes.size
-        shutterLocked = false
-        mainHandler.post { updateButtons() }
-        startSession()
-    }
-
     /** Camera thread. Switch photo mode between ~12 MP (zero lag, multi-frame) and full sensor resolution. */
     private fun toggleMaxRes() {
         if (!photoMode || maxResSize == null || processingPhoto) return
@@ -1036,7 +1474,7 @@ class MainActivity : Activity() {
         if (recording || !hdrSupported) return
         hdrOn = !hdrOn
         mainHandler.post { updateButtons() }
-        startSession()
+        restartVideo()
     }
 
     // ---------------------------------------------------------------- photo mode
@@ -1055,7 +1493,8 @@ class MainActivity : Activity() {
             closePhotoReader()
             mainHandler.post {
                 photoMode = photo
-                shutterLocked = false
+                activeControl = null
+                sliderPanel.visibility = View.GONE
                 styleRecordButton(false)
                 updateButtons()
                 statusText.text = if (photo) "Photo" else modeName(modes[modeIndex], hdrOn)
@@ -1089,14 +1528,12 @@ class MainActivity : Activity() {
         }
         b.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
         b.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
-        b.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_ON)
         b.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, photoFpsRange)
         // No electronic stabilization in photo mode: it would crop the preview differently from the photo.
         b.set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_OFF)
-        val ois = chars.get(CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION) ?: intArrayOf()
-        if (ois.contains(CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_ON)) {
-            b.set(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE, CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_ON)
-        }
+        applyOis(b)
+        applyZoom(b)
+        exposure.apply(b, photoFpsRange.upper, 1_000_000_000L / photoFpsRange.upper, video = false)
         return b
     }
 
@@ -1254,7 +1691,8 @@ class MainActivity : Activity() {
             b.set(CaptureRequest.SENSOR_PIXEL_MODE, CameraMetadata.SENSOR_PIXEL_MODE_MAXIMUM_RESOLUTION)
             b.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
             b.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
-            b.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_ON)
+            applyZoom(b)
+            exposure.apply(b, photoFpsRange.upper, 1_000_000_000L / photoFpsRange.upper, video = false)
             s.capture(b.build(), object : CameraCaptureSession.CaptureCallback() {
                 override fun onCaptureFailed(session: CameraCaptureSession, request: CaptureRequest, failure: CaptureFailure) {
                     maxResShotFailed("50 MP capture failed (reason ${failure.reason})")
