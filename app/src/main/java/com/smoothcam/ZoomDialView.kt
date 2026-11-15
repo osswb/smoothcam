@@ -16,6 +16,7 @@ import kotlin.math.abs
 import kotlin.math.ceil
 import kotlin.math.floor
 import kotlin.math.log2
+import kotlin.math.min
 import kotlin.math.pow
 import kotlin.math.roundToInt
 
@@ -76,18 +77,24 @@ class ZoomDialView(context: Context) : View(context) {
         }.start()
     }
 
-    /** Show the dial (or keep it shown); it hides 1.5 s after the last interaction. */
+    /**
+     * Show the dial (or keep it shown); it hides 1.5 s after the last interaction.
+     * It appears instantly: restarting a fade-in on every finger movement would keep it invisible
+     * for as long as the finger moves.
+     */
     fun show() {
         removeCallbacks(hideRunnable)
-        animate().cancel()
+        animate().cancel() // stops a fade-out in progress
+        alpha = 1f
         if (visibility != VISIBLE) {
-            alpha = 0f
             visibility = VISIBLE
             onShown?.invoke()
         }
-        animate().alpha(1f).setDuration(120).start()
         postDelayed(hideRunnable, 1500)
     }
+
+    /** Radius of the dial: smaller than the screen width so the scale curves visibly. */
+    private fun radius(): Float = min(width * 0.6f, 250f * density)
 
     fun beginDrag(rawX: Float) {
         lastX = rawX
@@ -102,7 +109,7 @@ class ZoomDialView(context: Context) : View(context) {
     /** Finger moving left turns the dial towards higher zoom, like on iPhone. */
     private fun dragBy(dx: Float) {
         if (width == 0) return
-        val radius = width * 0.95f
+        val radius = radius()
         val deg = Math.toDegrees((dx / radius).toDouble()).toFloat()
         val stops = -deg / degPerStop
         val newZoom = (zoom * 2.0.pow(stops.toDouble()).toFloat()).coerceIn(minZoom, maxZoom)
@@ -135,9 +142,9 @@ class ZoomDialView(context: Context) : View(context) {
     override fun onDraw(c: Canvas) {
         val w = width.toFloat()
         val h = height.toFloat()
-        val radius = w * 0.95f
+        val radius = radius()
         val cx = w / 2f
-        val top = 34f * density // room for the value above the arc
+        val top = 30f * density // room for the value above the arc
         val cy = top + radius
 
         // Dark band with a curved top edge (a huge circle, clipped by the view).

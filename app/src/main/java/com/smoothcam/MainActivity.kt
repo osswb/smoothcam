@@ -1108,7 +1108,7 @@ class MainActivity : Activity() {
             }
         }
         root.addView(zoomDial, FrameLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, dp(150), Gravity.BOTTOM
+            ViewGroup.LayoutParams.MATCH_PARENT, dp(118), Gravity.BOTTOM
         ).apply { bottomMargin = dp(186) })
         lensRow.onDragStart = { x -> zoomDial.beginDrag(x) }
         lensRow.onDragMove = { x -> zoomDial.dragTo(x) }
