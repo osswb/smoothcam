@@ -82,12 +82,17 @@ object PhotoProcessor {
      * frames[0] must be the newest frame (the moment the shutter was pressed).
      * Returns the saved photo's content URI. The frames' arrays are reused as scratch space.
      */
-    fun processAndSave(context: Context, frames: List<YuvFrame>, iso: Int, orientationDeg: Int, aspect: Int = 0): Uri {
+    fun processAndSave(context: Context, frames: List<YuvFrame>, iso: Int, orientationDeg: Int, aspect: Int = 0,
+                       digitalZoom: Float = 1f): Uri {
         val w = frames[0].width
         val h = frames[0].height
         merge(frames, iso)
         val ref = frames[0]
-        val c = cropToAspect(ref.y, ref.u, ref.v, w, h, aspect)
+        // In-app zoom (edge fill): the camera delivered the lens' whole picture; keep the zoomed centre.
+        val z = cropCentre(ref.y, ref.u, ref.v, w, h,
+            if (digitalZoom > 1.01f) ((w / digitalZoom).toInt() / 2) * 2 else w,
+            if (digitalZoom > 1.01f) ((h / digitalZoom).toInt() / 2) * 2 else h)
+        val c = cropToAspect(z.y, z.u, z.v, z.w, z.h, aspect)
         val nv21 = toneMapToNv21(c.y, c.u, c.v, c.w, c.h)
         return save(context, nv21, c.w, c.h, orientationDeg)
     }
@@ -105,7 +110,12 @@ object PhotoProcessor {
             1 -> ch = min(h, (w * 9 / 16) / 2 * 2)
             2 -> cw = min(w, h / 2 * 2)
         }
-        if (cw == w && ch == h) return Planes(y, u, v, w, h)
+        return cropCentre(y, u, v, w, h, cw, ch)
+    }
+
+    /** Centre crop to cw x ch (even sizes). */
+    fun cropCentre(y: ByteArray, u: ByteArray, v: ByteArray, w: Int, h: Int, cw: Int, ch: Int): Planes {
+        if (cw >= w && ch >= h) return Planes(y, u, v, w, h)
         val ox = ((w - cw) / 4) * 2
         val oy = ((h - ch) / 4) * 2
         val ny = ByteArray(cw * ch)

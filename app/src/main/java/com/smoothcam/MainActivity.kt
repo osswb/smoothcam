@@ -153,6 +153,14 @@ class MainActivity : Activity() {
     private val bgRaw = java.util.concurrent.ConcurrentHashMap<String, String>() // raw numbers, for camera info
     private lateinit var scrim: ScrimView
 
+    // Main-lens edge fill: in photo mode the camera stays at the current lens' own zoom (1x, 0.5x,
+    // telephoto) and the app zooms the viewfinder itself, so the area around the frame shows the
+    // lens' unused picture. Pixel crops extra lens streams to the viewfinder, so this is the only way.
+    @Volatile private var edgeFill = true
+    private lateinit var edgeButton: Button
+    private var frameW = 0 // viewfinder frame size before any in-app zoom
+    private var frameH = 0
+
     // Photo aspect ratio: 0 = 4:3, 1 = 16:9, 2 = 1:1
     @Volatile private var photoAspect = 0
     private lateinit var aspectLabel: TextView
@@ -268,6 +276,7 @@ class MainActivity : Activity() {
             return
         }
 
+        edgeFill = getSharedPreferences("smoothcam", MODE_PRIVATE).getBoolean("edgeFill", true)
         buildUi()
         preferHighRefreshDisplayMode()
 
@@ -398,8 +407,8 @@ class MainActivity : Activity() {
             ?: fhd
 
         // Photo mode: 4:3 viewfinder plus the largest 4:3 YUV stream (<= ~12.5 MP) that runs at 30 fps.
-        photoPreviewSize = previewSizes.firstOrNull { it == Size(1440, 1080) }
-            ?: previewSizes.filter { it.width * 3 == it.height * 4 && it.width <= 1920 }.maxByOrNull { it.width }
+        // Photo viewfinder: as sharp as reasonable, since with edge fill it is enlarged when zooming.
+        photoPreviewSize = previewSizes.filter { it.width * 3 == it.height * 4 && it.width <= 2048 }.maxByOrNull { it.width }
             ?: Size(1440, 1080)
         val yuvSizes = map.getOutputSizes(ImageFormat.YUV_420_888) ?: emptyArray()
         val yuv30 = yuvSizes.filter {
@@ -748,9 +757,27 @@ class MainActivity : Activity() {
 
     private fun applyZoom(b: CaptureRequest.Builder) {
         if (zoomRange.upper > zoomRange.lower) {
-            b.set(CaptureRequest.CONTROL_ZOOM_RATIO, zoomRatio.coerceIn(zoomRange.lower, zoomRange.upper))
+            b.set(CaptureRequest.CONTROL_ZOOM_RATIO, halZoom())
         }
     }
+
+    /** Zoom ratios at which a lens shows its full picture (0.5x, 1x, telephoto). */
+    private fun lensBases(): List<Float> {
+        val b = lenses.map { it.base.coerceIn(zoomRange.lower, zoomRange.upper) }.toMutableList()
+        if (zoomRange.lower < 0.95f) b += zoomRange.lower
+        b += 1f
+        return b.distinctBy { (it * 100).roundToInt() }.sorted()
+    }
+
+    /** The zoom the camera itself applies: with edge fill, the current lens' own zoom. */
+    private fun halZoom(): Float {
+        val z = zoomRatio.coerceIn(zoomRange.lower, zoomRange.upper)
+        if (!(photoMode && edgeFill)) return z
+        return lensBases().lastOrNull { it <= z + 0.001f } ?: zoomRange.lower
+    }
+
+    /** How much the app enlarges the viewfinder itself (1 = not at all). */
+    private fun viewfinderScale(): Float = if (photoMode && edgeFill) maxOf(1f, zoomRatio / halZoom()) else 1f
 
     /** Camera thread. Re-issue the repeating request soon, coalescing rapid changes (pinch, sliders). */
     private val repeatUpdate = Runnable { setRepeating(recording) }
@@ -954,24 +981,10 @@ class MainActivity : Activity() {
         // Portrait UI: the 16:9 sensor image is shown rotated, so the view is 9:16.
         val w = resources.displayMetrics.widthPixels
         val h = w * previewSize.width / previewSize.height
-        // Edge-fill views behind the main viewfinder, one per lens (sized and placed by positionBackground()).
-        for (lens in listOfNotNull(uwLens, mainLens).distinctBy { it.id }) {
-            val size = lens.bgSize ?: continue
-            val v = SurfaceView(this)
-            root.addView(v, FrameLayout.LayoutParams(1, 1, Gravity.TOP or Gravity.START))
-            v.holder.setFixedSize(size.width, size.height)
-            val id = lens.id
-            v.holder.addCallback(object : SurfaceHolder.Callback {
-                override fun surfaceCreated(holder: SurfaceHolder) { bgReady[id] = true }
-                override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {}
-                override fun surfaceDestroyed(holder: SurfaceHolder) { bgReady[id] = false }
-            })
-            bgViews[id] = v
-        }
-
         surfaceView = SurfaceView(this)
-        surfaceView.setZOrderMediaOverlay(true) // main viewfinder above the ultrawide one
         root.addView(surfaceView, FrameLayout.LayoutParams(w, h, Gravity.CENTER))
+        frameW = w
+        frameH = h
         surfaceView.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> positionBackground() }
 
         // Dims everything outside the frame that will be captured.
@@ -1176,6 +1189,14 @@ class MainActivity : Activity() {
             Gravity.TOP or Gravity.END
         ).apply { topMargin = dp(92); rightMargin = dp(16) })
 
+        edgeButton = pillButton().apply {
+            text = "Edges"
+            setOnClickListener { toggleEdgeFill() }
+        }
+        root.addView(edgeButton, FrameLayout.LayoutParams(dp(72), dp(34),
+            Gravity.TOP or Gravity.START
+        ).apply { topMargin = dp(136); leftMargin = dp(16) })
+
         rawButton = pillButton().apply {
             text = "RAW+"
             setOnClickListener { cameraHandler.post { toggleRaw() } }
@@ -1240,7 +1261,7 @@ class MainActivity : Activity() {
         setContentView(root)
         // Only compact (square or round) controls turn with the phone; the PHOTO/VIDEO labels and the
         // slider stay put, as on iPhone.
-        rotatables += listOf(recText, hdrButton, maxResButton, rawButton, aspectLabel, resLabel, fpsLabel, evChip, shutterChip, isoChip, thumbView)
+        rotatables += listOf(recText, hdrButton, maxResButton, rawButton, edgeButton, aspectLabel, resLabel, fpsLabel, evChip, shutterChip, isoChip, thumbView)
         rotatables += lensButtons
         styleRecordButton(false)
         updateButtons()
@@ -1320,6 +1341,8 @@ class MainActivity : Activity() {
         maxResButton.visibility = if (photoMode && maxResSize != null) View.VISIBLE else View.GONE
         rawButton.visibility = if (photoMode && rawSize != null) View.VISIBLE else View.GONE
         aspectLabel.visibility = if (photoMode) View.VISIBLE else View.GONE
+        edgeButton.visibility = if (photoMode) View.VISIBLE else View.GONE
+        stylePill(edgeButton, edgeFill)
         aspectLabel.text = ASPECTS[photoAspect]
         stylePill(rawButton, rawOn)
         maxResSize?.let { maxResButton.text = String.format(Locale.US, "%.0f MP", it.width * it.height / 1_000_000.0) }
@@ -1476,17 +1499,19 @@ class MainActivity : Activity() {
         }
     }
 
-    /** The part of the viewfinder that will be captured (photo aspect ratio applied). */
+    /** The part of the screen that will be captured (photo aspect ratio applied), centred like the viewfinder. */
     private fun captureRect(): android.graphics.Rect {
-        val l = surfaceView.left
-        val t = surfaceView.top
-        val r = surfaceView.right
-        val b = surfaceView.bottom
+        val rw = if (rootView.width > 0) rootView.width else resources.displayMetrics.widthPixels
+        val rh = if (rootView.height > 0) rootView.height else resources.displayMetrics.heightPixels
+        val l = (rw - frameW) / 2
+        val t = (rh - frameH) / 2
+        val r = l + frameW
+        val b = t + frameH
         val cx = (l + r) / 2
         val cy = (t + b) / 2
         if (!photoMode) return android.graphics.Rect(l, t, r, b)
         return when (photoAspect) {
-            1 -> { // 16:9 photo = 9:16 in portrait: crop the sides of the 3:4 viewfinder
+            1 -> { // 16:9 photo = 9:16 in portrait: crop the sides of the 3:4 frame
                 val half = ((b - t) * 9 / 16) / 2
                 android.graphics.Rect(cx - half, t, cx + half, b)
             }
@@ -1499,76 +1524,35 @@ class MainActivity : Activity() {
     }
 
     /**
-     * Main thread. Choose the lens that fills the edges and line its picture up with the viewfinder.
-     *
-     * The viewfinder shows the main lens zoomed by z, i.e. a field of view of main.tan / z. A lens
-     * can fill the screen around it if its field of view is at least that times how far the screen
-     * reaches beyond the viewfinder. Of the lenses that can, the narrowest (sharpest) one is used:
-     * the ultrawide near 1x, the main lens' own uncropped picture once zoomed in further.
-     * Each lens' picture is scaled by its field of view and shifted by its optical centre.
+     * Main thread. Size the viewfinder for the in-app zoom (edge fill) and dim everything outside
+     * the capture area. With edge fill, the camera shows the lens' whole picture and the viewfinder
+     * is enlarged by zoom / lens zoom, so what lies outside the frame is the lens' unused area.
      */
     private fun positionBackground() {
-        if (!::scrim.isInitialized) return
+        if (!::scrim.isInitialized || frameW == 0) return
+        val s = viewfinderScale()
+        val lp = surfaceView.layoutParams as FrameLayout.LayoutParams
+        val w = (frameW * s).roundToInt()
+        val h = (frameH * s).roundToInt()
+        if (lp.width != w || lp.height != h || lp.gravity != Gravity.CENTER) {
+            lp.width = w
+            lp.height = h
+            lp.gravity = Gravity.CENTER
+            surfaceView.layoutParams = lp
+        }
         val hole = captureRect()
         scrim.setHole(hole.left, hole.top, hole.right, hole.bottom)
+    }
 
-        val main = mainLens
-        val fw = surfaceView.width.toFloat()
-        val fh = surfaceView.height.toFloat()
-        var chosen: LensInfo? = null
-        if (photoMode && main != null && fw > 0f && fh > 0f && bgStreams.isNotEmpty()) {
-            val z = zoomRatio
-            val cx = surfaceView.left + fw / 2f
-            val cy = surfaceView.top + fh / 2f
-            // How far the screen reaches beyond the viewfinder, in viewfinder half-sizes.
-            // Portrait: the viewfinder's height is the sensor's long side (X), its width the short side (Y).
-            val needX = maxOf(cy, rootView.height - cy) / (fh / 2f)
-            val needY = maxOf(cx, rootView.width - cx) / (fw / 2f)
-            val frameTanX = main.tanX / z
-            val frameTanY = main.tanY / z
-            // What each lens' stream really shows: its field of view, reduced by any crop the camera applies.
-            fun tX(l: LensInfo) = l.tanX * (bgCrop[l.id]?.get(0) ?: 1f)
-            fun tY(l: LensInfo) = l.tanY * (bgCrop[l.id]?.get(1) ?: 1f)
-            fun oX(l: LensInfo) = l.offX - (bgCrop[l.id]?.get(2) ?: 0f)
-            fun oY(l: LensInfo) = l.offY - (bgCrop[l.id]?.get(3) ?: 0f)
-            val streamed = lenses.filter { it.id in bgStreams }.sortedBy { tX(it) }
-            chosen = streamed.firstOrNull { tX(it) / frameTanX >= needX && tY(it) / frameTanY >= needY }
-                ?: streamed.lastOrNull()?.takeIf { tX(it) / frameTanX > 1.03f } // best effort: widest
-            if (chosen != null) {
-                val sx = tY(chosen) / frameTanY // width scale
-                val sy = tX(chosen) / frameTanX // height scale
-                val bw = fw * sx
-                val bh = fh * sy
-                // Optical-centre alignment, converted from sensor axes to portrait screen axes.
-                val dBufX = (main.offX - oX(chosen)) * (fh / 2f) / frameTanX
-                val dBufY = (main.offY - oY(chosen)) * (fw / 2f) / frameTanY
-                val dxs = if (sensorOrientation == 270) dBufY else -dBufY
-                val dys = if (sensorOrientation == 270) -dBufX else dBufX
-                val v = bgViews[chosen.id]
-                if (v != null) {
-                    val lp = v.layoutParams as FrameLayout.LayoutParams
-                    lp.width = bw.toInt()
-                    lp.height = bh.toInt()
-                    lp.leftMargin = (cx - bw / 2f + dxs).toInt()
-                    lp.topMargin = (cy - bh / 2f + dys).toInt()
-                    v.layoutParams = lp
-                }
-            }
-        }
-        // Park the views that aren't in use.
-        for ((id, v) in bgViews) {
-            if (id == chosen?.id) continue
-            val lp = v.layoutParams as FrameLayout.LayoutParams
-            if (lp.width != 1) {
-                lp.width = 1; lp.height = 1; lp.leftMargin = 0; lp.topMargin = 0
-                v.layoutParams = lp
-            }
-        }
-        val newSource = chosen?.id
-        if (newSource != bgSource) {
-            bgSource = newSource
-            requestRepeatingUpdate() // stream only the lens in use
-        }
+    /** Main thread. Edge fill on/off (photo mode). */
+    private fun toggleEdgeFill() {
+        edgeFill = !edgeFill
+        getSharedPreferences("smoothcam", MODE_PRIVATE).edit().putBoolean("edgeFill", edgeFill).apply()
+        positionBackground()
+        requestRepeatingUpdate()
+        updateButtons()
+        toast(if (edgeFill) "Edge fill on: the area around the frame shows the rest of the lens' picture"
+              else "Edge fill off: the camera zooms by itself (sharpest viewfinder)")
     }
 
     private fun zoomLabel(z: Float): String = when {
@@ -1757,15 +1741,8 @@ class MainActivity : Activity() {
         sb.append("Per-lens settings accepted: zoom ${physKeys.contains(CaptureRequest.CONTROL_ZOOM_RATIO)}, " +
             "crop ${physKeys.contains(CaptureRequest.SCALER_CROP_REGION)}\n")
         bgRaw.forEach { (id, raw) -> sb.append("Lens $id reports: $raw\n") }
-        sb.append("Edge fill: " + when {
-            bgViews.isEmpty() -> "no extra lens streams offered to apps"
-            !photoMode -> "photo mode only"
-            bgStreams.isEmpty() -> "camera refused the extra streams"
-            else -> "streaming ${bgStreams.joinToString()}, showing ${bgSource ?: "none (frame already covers the screen)"}" +
-                bgCrop.entries.joinToString("") { (id, c) ->
-                    String.format(Locale.US, "; lens %s streams %.0f%% of its view", id, c[0] * 100)
-                }
-        } + "\n")
+        sb.append("Edge fill: " + (if (edgeFill) "on" else "off") +
+            String.format(Locale.US, " (camera zoom %.2f×, viewfinder enlarged %.2f×)", halZoom(), viewfinderScale()) + "\n")
         if (!photoMode) {
             sb.append("\nAsked for: $wantedLabel\nRunning: ${modeName(modes[modeIndex], sessionHdr)}, ${stabName(sessionStab)}\n")
         }
@@ -1890,12 +1867,15 @@ class MainActivity : Activity() {
         // (its sides run off-screen, like on iPhone).
         val screenW = resources.displayMetrics.widthPixels
         val w = if (photoMode && photoAspect == 1) screenW * 4 / 3 else screenW
+        frameW = w
+        frameH = w * size.width / size.height
         val lp = surfaceView.layoutParams as FrameLayout.LayoutParams
-        lp.width = w
-        lp.height = w * size.width / size.height
+        lp.width = frameW
+        lp.height = frameH
         lp.gravity = Gravity.CENTER
         surfaceView.layoutParams = lp
         surfaceView.holder.setFixedSize(size.width, size.height)
+        positionBackground()
     }
 
     private fun photoRequestBuilder(cam: CameraDevice, physicalIds: Set<String> = emptySet()): CaptureRequest.Builder {
@@ -2373,7 +2353,8 @@ class MainActivity : Activity() {
      * Copies the frames out of the camera's buffers (and returns the buffers), shows a quick
      * thumbnail, then queues the real processing. Takes ownership of the Images.
      */
-    private fun processFrames(frames: List<Image>, iso: Int, orientation: Int, aspect: Int = photoAspect) {
+    private fun processFrames(frames: List<Image>, iso: Int, orientation: Int, aspect: Int = photoAspect,
+                              digitalZoom: Float = viewfinderScale()) {
         val t0 = SystemClock.elapsedRealtime()
         copyExecutor.execute {
             val copies = try {
@@ -2402,7 +2383,7 @@ class MainActivity : Activity() {
             }
             photoExecutor.execute {
                 val uri = try {
-                    PhotoProcessor.processAndSave(this, copies, iso, orientation, aspect)
+                    PhotoProcessor.processAndSave(this, copies, iso, orientation, aspect, digitalZoom)
                 } catch (e: Throwable) {
                     Log.e(TAG, "photo processing failed", e)
                     null
